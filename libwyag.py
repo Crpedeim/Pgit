@@ -190,7 +190,7 @@ def repo_dir(repo , *path , mkdir=False):
             raise Exception(f"Not a directory {path}")
         
     if mkdir:
-        os.mkdirs(path)
+        os.makedirs(path)
         return path
     else:
         return None
@@ -275,7 +275,7 @@ class GitObject(object):
         else:
             self.init()
 
-    def sereialise(self, repo):
+    def serialise(self):
          """This function MUST be implemented by subclasses.
 
 It must read the object's contents from self.data, a byte string, and
@@ -286,7 +286,7 @@ What exactly that means depend on each subclass.
          
          raise Exception("Unimplemented")
 
-    def deserailise(self, data):
+    def deserialise(self, data):
         raise Exception("Unimplemented")
 
     def init(self):
@@ -331,7 +331,7 @@ def object_write(obj , repo):
 
         if repo:
 
-            path = repo_file(repo,sha[0:2],sha[2:0],mkdir=True)
+            path = repo_file(repo,"objects",sha[0:2],sha[2:],mkdir=True)
 
             if not os.path.exists(path): #??
                 with open(path, 'wb') as f:
@@ -344,10 +344,10 @@ class GitBlob(GitObject):
 
     fmt = b'blob'
 
-    def sereialise(self, repo):
+    def serialise(self):
         return self.blobdata
-    
-    def deserailise(self, data):
+
+    def deserialise(self, data):
          self.blobdata = data
 
     
@@ -358,7 +358,7 @@ def cmd_cat_file(args):
 
 def cat_file(repo , obj , fmt=None):
     obj = object_read(repo , object_find(repo, obj , fmt=fmt))
-    sys.stdout.buffer.write(obj.sereialise())
+    sys.stdout.buffer.write(obj.serialise())
 
 def object_resolve(repo, name):
     """Resolve name to an object hash in repo.
@@ -488,7 +488,7 @@ def kvlm_parse(raw, start=0 , dct=None):
 
     if(spc < 0) or (nl < spc):
         assert nl == start
-        dict[None] = raw[start+1:]
+        dct[None] = raw[start+1:]
         return dct
     
     key = raw[start:spc]
@@ -500,7 +500,7 @@ def kvlm_parse(raw, start=0 , dct=None):
         end = raw.find(b'\n' , end+1)
         if raw[end+1] != ord(' '): break
     
-    value = raw[spc+1:end].replace(b'\n' , b'\n') #???
+    value = raw[spc+1:end].replace(b'\n ' , b'\n')
 
     if key in dct:
         if type(dct[key] ) == list:
@@ -522,9 +522,12 @@ def kvlm_serialsie(kvlm):
         if k == None: continue
 
         val = kvlm[k]
+        # A key may hold a single value or a list of values; normalize to list.
+        if type(val) != list:
+            val = [val]
 
         for v in val:
-            ret+= k + b' ' + (v.replace(b'\n', b'\n')) + b'\n'
+            ret+= k + b' ' + (v.replace(b'\n', b'\n ')) + b'\n'
         
     ret += b'\n' + kvlm[None]
     return ret
@@ -534,7 +537,7 @@ class GitCommit(GitObject):
 
     fmt = b'commit'
 
-    def sereialise(self, data):
+    def serialise(self):
         return kvlm_serialsie(self.kvlm)
     
     def deserialise(self, data):
@@ -584,7 +587,7 @@ def log_graphviz(repo, sha, seen):
 
 class GitTreeLeaf(object):
 
-    def _init_(self, mode,path,sha):
+    def __init__(self, mode,path,sha):
         self.mode = mode
         self.path = path
         self.sha = sha
@@ -642,10 +645,10 @@ def tree_serialize(obj):
 class GitTree(GitObject):
     fmt=b'tree'
 
-    def deserialize(self, data):
+    def deserialise(self, data):
         self.items = tree_parse(data)
 
-    def serialize(self):
+    def serialise(self):
         return tree_serialize(self)
 
     def init(self): #????
@@ -751,7 +754,7 @@ def ref_list(repo, path=None):
         if os.path.isdir(can):
                 ret[f] = ref_list(repo,can)
         else:
-            ret[f] = ref_list(repo,can)
+            ret[f] = ref_resolve(repo,can)
 
     return ret
 
@@ -1567,29 +1570,6 @@ def cmd_commit(args):
     else: # Otherwise, we update HEAD itself.
         with open(repo_file(repo, "HEAD"), "w") as fd:
             fd.write("\n")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    
-
-
-
-
               
 
 
