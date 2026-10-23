@@ -1629,7 +1629,8 @@ def cmd_check_ignore(args):
     rules = gitignore_read(repo)
     for path in args.path:
         # Like Git, an existing directory matches directory-only patterns.
-        is_dir = os.path.isdir(os.path.join(repo.worktree, path))
+        full = os.path.join(repo.worktree, path)
+        is_dir = os.path.isdir(full) and not os.path.islink(full)
         if check_ignore(rules, path, is_dir):
             print(path)
 
@@ -1699,6 +1700,11 @@ def cmd_status_head_index(repo, index):
         print("  deleted: ", entry)
 
 
+def symlink_sha(path):
+    """A symlink is stored as a blob of its target path, not followed."""
+    return object_write(GitBlob(os.fsencode(os.readlink(path))), None)
+
+
 def cmd_status_index_worktree(repo, index):
     print("Changes not staged for commit:")
 
@@ -1709,10 +1715,11 @@ def cmd_status_index_worktree(repo, index):
     all_files = list()
 
     # We begin by walking the filesystem
-    for (root, _, files) in os.walk(repo.worktree, True):
+    for (root, dirs, files) in os.walk(repo.worktree, True):
         if root==repo.gitdir or root.startswith(gitdir_prefix):
             continue
-        for f in files:
+        # A symlink to a directory is a file to Git (os.walk lists it as a dir).
+        for f in files + [d for d in dirs if os.path.islink(os.path.join(root, d))]:
             full_path = os.path.join(root, f)
             rel_path = os.path.relpath(full_path, repo.worktree)
             all_files.append(rel_path)
@@ -1725,7 +1732,16 @@ def cmd_status_index_worktree(repo, index):
 
         # That file *name* is in the index
 
-        if not os.path.isfile(full_path): # Gone, or replaced by a directory
+        if entry.mode_type == 0b1110: # Submodule: its contents belong to its own repository
+            if not os.path.lexists(full_path):
+                print("  deleted: ", entry.name)
+        elif entry.mode_type == 0b1010: # Symlink: the blob holds the link's target
+            if not os.path.lexists(full_path) or \
+               (os.path.isdir(full_path) and not os.path.islink(full_path)):
+                print("  deleted: ", entry.name) # Gone, or replaced by a directory
+            elif not os.path.islink(full_path) or symlink_sha(full_path) != entry.sha:
+                print("  modified:", entry.name)
+        elif not os.path.isfile(full_path): # Gone, or replaced by a directory
             print("  deleted: ", entry.name)
         else:
             stat = os.stat(full_path)
@@ -1865,7 +1881,7 @@ def add_to_index(repo, index, paths):
     clean_paths = set()
     for path in paths:
         abspath = os.path.abspath(path)
-        if not (abspath.startswith(worktree) and os.path.isfile(abspath)):
+        if not (abspath.startswith(worktree) and (os.path.isfile(abspath) or os.path.islink(abspath))):
             raise Exception(f"Not a file, or outside the worktree: {paths}")
         relpath = os.path.relpath(abspath, repo.worktree)
         clean_paths.add((abspath,  relpath))
@@ -1885,6 +1901,17 @@ def add_to_index(repo, index, paths):
                      and not any(e.name.startswith(d) for d in new_files)]
 
     for (abspath, relpath) in clean_paths:
+        if os.path.islink(abspath): # Stage the link itself, not what it points to
+            stat = os.lstat(abspath)
+            ctime_s, ctime_ns = divmod(stat.st_ctime_ns, 10**9)
+            mtime_s, mtime_ns = divmod(stat.st_mtime_ns, 10**9)
+            sha = object_write(GitBlob(os.fsencode(os.readlink(abspath))), repo)
+            index.entries.append(GitIndexEntry(
+                ctime=(ctime_s, ctime_ns), mtime=(mtime_s, mtime_ns), dev=stat.st_dev,
+                ino=stat.st_ino, mode_type=0b1010, mode_perms=0, uid=stat.st_uid,
+                gid=stat.st_gid, fsize=stat.st_size, sha=sha, flag_assume_valid=False,
+                flag_stage=False, name=relpath))
+            continue
         with open(abspath, "rb") as fd:
             sha = object_hash(fd, b"blob", repo)
 

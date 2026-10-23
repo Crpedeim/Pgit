@@ -4,7 +4,8 @@
 Repositories are built to cover the pack format: a history of edits packed
 with --aggressive (deep OFS_DELTA chains), the same history repacked with
 REF_DELTA, a file over 64 KiB (delta copies of exactly 0x10000 bytes),
-annotated tags, binary files and nested directories. Real repositories can
+annotated tags, binary files, nested directories, symlinks and a submodule
+entry. Real repositories can
 be added with --clone URL or --repo PATH.
 
 For each repository:
@@ -89,6 +90,13 @@ def build_history(repo, rng, commits):
             os.makedirs(os.path.dirname(full), exist_ok=True)
             with open(full, "wb") as f:
                 f.write(data)
+        if n == 3:
+            os.symlink("src/mod0.py", os.path.join(repo, "link-to-mod0"))
+            os.symlink("docs", os.path.join(repo, "link-to-docs"))
+            # A submodule entry (gitlink); a clone checks it out as an empty dir.
+            os.makedirs(os.path.join(repo, "vendor/lib"))
+            git(repo, "update-index", "--add", "--cacheinfo",
+                f"160000,{'ab' * 20},vendor/lib")
         git(repo, "add", "-A")
         git(repo, "commit", "-q", "-m", f"commit {n}\n\nbody of commit {n}")
         if n % 40 == 0:
@@ -199,7 +207,9 @@ def check_cli(repo, worktree):
         changes = [l for l in status if l.startswith("  ")]
         if changes:
             raise Failure(f"pgit status on a fresh checkout isn't clean: {changes[:3]}")
-        tracked = git(repo, "ls-files").stdout.split("\n")[0]
+        tracked = next(line.split("\t", 1)[1] for line in
+                       git(repo, "ls-files", "-s").stdout.splitlines()
+                       if line.startswith("100644 "))
         with open(os.path.join(repo, tracked), "ab") as f:
             f.write(b"\nedited by pgit\n")
         before = git(repo, "rev-parse", "HEAD").stdout.strip()
@@ -252,7 +262,7 @@ def main():
     failures = 0
     try:
         print("Building repositories...", flush=True)
-        repos = [(name, path, False) for name, path in build(base, args.commits, args.seed)]
+        repos = [(name, path, True) for name, path in build(base, args.commits, args.seed)]
         for url in args.clone:
             dest = os.path.join(base, "clone-" + str(len(repos)))
             p = git(base, "clone", "-q", url, dest, check=False)

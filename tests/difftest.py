@@ -4,7 +4,7 @@ Git side by side and checks that they never disagree.
 
 Operations include the edge cases that broke Pgit before: rewriting a file
 right after staging it (same size, same timestamp), and replacing a file
-with a directory. A gc operation has real Git pack either repository
+with a directory. Symlinks (some dangling) are created too. A gc operation has real Git pack either repository
 (objects into a packfile, refs into packed-refs) mid-sequence.
 
 Each sequence builds two repositories from the same random operations, one
@@ -103,6 +103,9 @@ def gen_op(rng, n):
     if r < 0.85:
         return {"op": "gc", "target": rng.choice(["pgit", "git", "both"]),
                 "aggressive": rng.random() < 0.3}
+    if r < 0.88:
+        return {"op": "symlink", "path": rand_path(rng),
+                "target": rng.choice(["f.txt", "a", "a/b/f", "../f.txt", "missing"])}
     return {"op": "commit", "message": f"commit {n}"}
 
 
@@ -177,6 +180,10 @@ def worktree_files(root):
     return sorted(files)
 
 
+def regular_files(root):
+    return [p for p in worktree_files(root) if not os.path.islink(os.path.join(root, p))]
+
+
 def index_paths(env, repo):
     out = git(env, repo, "ls-files", "-z").stdout
     return set(p.decode() for p in out.split(b"\0") if p)
@@ -188,7 +195,7 @@ def can_write(root, path):
         return False
     parent = os.path.dirname(path)
     while parent:
-        if os.path.isfile(os.path.join(root, parent)):
+        if os.path.isfile(os.path.join(root, parent)) or os.path.islink(os.path.join(root, parent)):
             return False
         parent = os.path.dirname(parent)
     return True
@@ -205,7 +212,8 @@ def apply_op(env, op, pg, rg):
     kind = op["op"]
 
     if kind == "write":
-        if not (can_write(rg, op["path"]) and can_write(pg, op["path"])):
+        if not (can_write(rg, op["path"]) and can_write(pg, op["path"])) \
+           or os.path.islink(os.path.join(rg, op["path"])):
             return False
         for root in (pg, rg):
             full = os.path.join(root, op["path"])
@@ -223,7 +231,7 @@ def apply_op(env, op, pg, rg):
         return True
 
     if kind == "chmod":
-        path = pick(op, worktree_files(rg))
+        path = pick(op, regular_files(rg))
         if not path:
             return False
         for root in (pg, rg):
@@ -236,7 +244,8 @@ def apply_op(env, op, pg, rg):
             paths = worktree_files(rg)
         else:
             paths = sorted(set(p for p in op["paths"]
-                               if os.path.isfile(os.path.join(rg, p))))
+                               if os.path.isfile(os.path.join(rg, p))
+                               or os.path.islink(os.path.join(rg, p))))
         if not paths:
             return False
         # Git 2.43 quirk: when a tracked file sits two or more levels above
@@ -268,7 +277,7 @@ def apply_op(env, op, pg, rg):
     if kind == "add-rewrite":
         # Stage a file, then at once overwrite it with different content of
         # the same size: the timestamps may not change ("racy git").
-        path = pick(op, worktree_files(rg))
+        path = pick(op, regular_files(rg))
         if not path:
             return False
         git(env, rg, "add", "-f", "--", path)
@@ -291,6 +300,17 @@ def apply_op(env, op, pg, rg):
             os.makedirs(os.path.join(root, path))
             with open(os.path.join(root, path, op["name"]), "wb") as f:
                 f.write(b"now a directory\n")
+        return True
+
+    if kind == "symlink":
+        # Targets stay inside the repository; some dangle.
+        if not (can_write(rg, op["path"]) and can_write(pg, op["path"])) \
+           or os.path.lexists(os.path.join(rg, op["path"])):
+            return False
+        for root in (pg, rg):
+            full = os.path.join(root, op["path"])
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            os.symlink(op["target"], full)
         return True
 
     if kind == "gc":
@@ -338,10 +358,11 @@ def git_status_set(env, repo):
         if xy == "??":
             result.add(("untracked", path))
             continue
-        if xy[0] in "AMD":
-            result.add(({"A": "added", "M": "modified", "D": "deleted"}[xy[0]], path))
-        if xy[1] in "MD":
-            result.add(({"M": "wt-modified", "D": "wt-deleted"}[xy[1]], path))
+        # T (typechange, e.g. symlink <-> file) is "modified" to Pgit.
+        if xy[0] in "AMDT":
+            result.add(({"A": "added", "M": "modified", "T": "modified", "D": "deleted"}[xy[0]], path))
+        if xy[1] in "MDT":
+            result.add(({"M": "wt-modified", "T": "wt-modified", "D": "wt-deleted"}[xy[1]], path))
     return result
 
 
@@ -372,7 +393,15 @@ def ignore_candidates(root):
     for d in DIRS:
         for n in NAMES:
             cands.add(os.path.join(d, n) if d else n)
-    return sorted(c for c in cands if not c.endswith(".gitignore"))
+    # Git rejects paths beyond a symlink ("beyond a symbolic link").
+    def through_link(path):
+        parent = os.path.dirname(path)
+        while parent:
+            if os.path.islink(os.path.join(root, parent)):
+                return True
+            parent = os.path.dirname(parent)
+        return False
+    return sorted(c for c in cands if not c.endswith(".gitignore") and not through_link(c))
 
 
 def expect_equal(check, what, got, want):
@@ -500,7 +529,7 @@ def plant_canary(env, base, pg, rg, rng):
     shutil.rmtree(copy, ignore_errors=True)
     shutil.copytree(pg, copy, symlinks=True)
     kind = rng.choice(["stage", "commit"])
-    files = worktree_files(copy)
+    files = regular_files(copy)
     path = rng.choice(files) if files else "canary.txt"
     with open(os.path.join(copy, path), "ab") as f:
         f.write(b"canary\n")

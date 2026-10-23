@@ -158,7 +158,7 @@ Loose objects (one zlib file per object) are only how *new* objects start out. `
 - **Deltas:** `OFS_DELTA` names its base by a backwards offset in the same pack, and `REF_DELTA` by SHA. A delta is a list of *copy a range of the base* and *insert these bytes* instructions. Chains can be hundreds deep, so they're walked with a loop, not recursion, and recently built objects are kept in a small LRU cache.
 - **`packed-refs`:** branches and tags packed into one file. A loose ref file still wins, so `pgit commit` on a packed branch writes a loose ref, just as Git does.
 
-`tests/packtest.py` builds repositories that hit each part of the format (deep `OFS_DELTA` chains via `gc --aggressive`, a `REF_DELTA` repack, a file over 64 KiB so deltas use the special 0x10000-byte copy, annotated tags) and can add any real clone. For every repository, **every object** Pgit reads must be byte-identical to `git cat-file`, including a random sample read cold in random order. Abbreviated SHAs, `show-ref`, `log`, `ls-tree`, a clean `status` and a commit on top that passes `git fsck` are checked too. The differential tester also runs `git gc` mid-sequence, so Pgit keeps working after Git packs everything.
+`tests/packtest.py` builds repositories that hit each part of the format (deep `OFS_DELTA` chains via `gc --aggressive`, a `REF_DELTA` repack, a file over 64 KiB so deltas use the special 0x10000-byte copy, annotated tags, symlinks and a submodule) and can add any real clone. For every repository, **every object** Pgit reads must be byte-identical to `git cat-file`, including a random sample read cold in random order. Abbreviated SHAs, `show-ref`, `log`, `ls-tree`, a clean `status` and a commit on top that passes `git fsck` are checked too. The differential tester also runs `git gc` mid-sequence, so Pgit keeps working after Git packs everything, and creates symlinks (some dangling).
 
 | Repository | Objects | Stored as deltas | Longest delta chain | Result |
 |---|---|---|---|---|
@@ -166,9 +166,21 @@ Loose objects (one zlib file per object) are only how *new* objects start out. `
 | Built: `REF_DELTA` repack | 2,361 | 1,188 (`REF_DELTA`) | 24 | all byte-identical |
 | [pallets/flask](https://github.com/pallets/flask) | 26,390 | 17,638 | 22 | all byte-identical, ~13,000 objects/s |
 | Flask repacked `--depth=250` | 26,390 | 18,814 | 173 | all byte-identical |
-| [git/git](https://github.com/git/git) | 422,278 | 320,022 | 50 | all byte-identical, ~3,700 objects/s |
+| [git/git](https://github.com/git/git) | 410,700 | 312,684 | 50 | all byte-identical, ~7,500 objects/s |
 
-Eight more mutants break one rule of the pack format each (for example the `+1` in `OFS_DELTA` offsets, or the size-0 copy meaning 0x10000), and every one is caught.
+On Flask and git/git, `log` walks the whole history, `show-ref`, `ls-tree` and abbreviated SHAs match Git, `status` is clean on a fresh checkout, and a commit made by Pgit on top passes `git fsck`.
+
+**Bugs this found and fixed** (each is now a mutant, alongside eight that break one rule of the pack format, such as the `+1` in `OFS_DELTA` offsets or the size-0 copy meaning 0x10000):
+
+| Bug | Found by |
+|---|---|
+| Every lookup crashed in a fully packed clone (no `objects/xx/` directories) | Flask clone |
+| Odd-length abbreviated SHAs (`00bee`) found nothing: the scan stopped at `00be8d…` | packtest |
+| `log` recursed once per commit, far past Python's recursion limit on real histories | review |
+| `status` followed symlinks and compared the target's content (Git stores the link text) | git/git |
+| `add` staged what a symlink points to instead of the link (mode `120000`) | difftest |
+| An unpopulated submodule (gitlink, mode `160000`) showed as deleted | git/git |
+| A symlink to a directory was missing from untracked files | review |
 
 ```bash
 python3 tests/packtest.py                     # built repositories, offline

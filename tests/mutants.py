@@ -104,13 +104,27 @@ MUTANTS = [
      '''        f.write(e.fsize.to_bytes(4, "big"))'''),
 
     ("status treats a file replaced by a directory as modified",
-     '''        if not os.path.isfile(full_path): # Gone, or replaced by a directory''',
-     '''        if not os.path.exists(full_path):'''),
+     '''        elif not os.path.isfile(full_path): # Gone, or replaced by a directory''',
+     '''        elif not os.path.exists(full_path):'''),
 
     ("add leaves a file and a directory with the same name in the index",
      '''                     if e.name not in conflicts
                      and not any(e.name.startswith(d) for d in new_files)]''',
      '''                     if True]'''),
+
+    ("status follows symlinks instead of comparing the link",
+     '''            elif not os.path.islink(full_path) or symlink_sha(full_path) != entry.sha:''',
+     '''            elif open(full_path, "rb").read() != object_read(repo, entry.sha).blobdata:'''),
+
+    ("add stages what a symlink points to instead of the link",
+     '''        if os.path.islink(abspath): # Stage the link itself, not what it points to''',
+     '''        if False:'''),
+
+    ("status reports an unpopulated submodule as deleted",
+     '''        if entry.mode_type == 0b1110: # Submodule: its contents belong to its own repository
+            if not os.path.lexists(full_path):''',
+     '''        if entry.mode_type == 0b1110:
+            if not os.path.isfile(full_path):''', "packtest"),
 
     ("rm crashes on a file already deleted from disk",
      '''            if os.path.lexists(path): # It may already be gone from the worktree
