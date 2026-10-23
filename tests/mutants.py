@@ -37,12 +37,12 @@ MUTANTS = [
      '''    if leaf.mode.startswith(b"4"):'''),
 
     ("index written without its SHA-1 trailer",
-     '''        raw.write(f.h.digest())''',
-     '''        pass'''),
+     '''    raw.write(f.h.digest())''',
+     '''    pass'''),
 
     ("index entries not sorted by path",
-     '''        index.entries.sort(key=lambda e: e.name.encode("utf8"))''',
-     '''        pass'''),
+     '''    index.entries.sort(key=lambda e: e.name.encode("utf8"))''',
+     '''    pass'''),
 
     ("negative timezone offsets malformed",
      '''    hours = abs(offset) // 3600
@@ -96,6 +96,23 @@ MUTANTS = [
     ("init writes core.filemode = false",
      '''    ret.set("core", "filemode", "false" if os.name == "nt" else "true")''',
      '''    ret.set("core", "filemode", "false")'''),
+
+    ("index_write doesn't smudge racily clean entries",
+     '''        f.write((0 if e.mtime[0] >= index_mtime_s else e.fsize).to_bytes(4, "big"))''',
+     '''        f.write(e.fsize.to_bytes(4, "big"))'''),
+
+    ("status trusts timestamps of racily clean entries",
+     '''            racy = entry.mtime[0] >= index_mtime // 10**9''',
+     '''            racy = False'''),
+
+    ("status treats a file replaced by a directory as modified",
+     '''        if not os.path.isfile(full_path): # Gone, or replaced by a directory''',
+     '''        if not os.path.exists(full_path):'''),
+
+    ("add leaves a file and a directory with the same name in the index",
+     '''                     if e.name not in conflicts
+                     and not any(e.name.startswith(d) for d in new_files)]''',
+     '''                     if True]'''),
 
     ("rm crashes on a file already deleted from disk",
      '''            if os.path.lexists(path): # It may already be gone from the worktree

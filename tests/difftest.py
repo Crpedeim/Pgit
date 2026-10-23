@@ -2,6 +2,10 @@
 """Differential tester: runs random operation sequences through Pgit and real
 Git side by side and checks that they never disagree.
 
+Operations include the edge cases that broke Pgit before: rewriting a file
+right after staging it (same size, same timestamp), and replacing a file
+with a directory.
+
 Each sequence builds two repositories from the same random operations, one
 with Pgit and one with real Git. After every operation the harness compares:
 
@@ -88,8 +92,13 @@ def gen_op(rng, n):
     if r < 0.70:
         return {"op": "add", "paths": "*" if rng.random() < 0.3
                 else [rand_path(rng) for _ in range(rng.randint(1, 3))]}
-    if r < 0.78:
+    if r < 0.76:
         return {"op": "rm", "pick": rng.randrange(1 << 16)}
+    if r < 0.80:
+        return {"op": "add-rewrite", "pick": rng.randrange(1 << 16)}
+    if r < 0.82:
+        return {"op": "file-to-dir", "pick": rng.randrange(1 << 16),
+                "name": rng.choice(NAMES)}
     return {"op": "commit", "message": f"commit {n}"}
 
 
@@ -233,10 +242,39 @@ def apply_op(env, op, pg, rg):
 
     if kind == "rm":
         path = pick(op, index_paths(env, rg))
-        if not path:
+        # Git refuses to rm a path that has become a directory.
+        if not path or os.path.isdir(os.path.join(rg, path)):
             return False
         git(env, rg, "rm", "-q", "-f", "--", path)
         pgit(pg, "rm", path)
+        return True
+
+    if kind == "add-rewrite":
+        # Stage a file, then at once overwrite it with different content of
+        # the same size: the timestamps may not change ("racy git").
+        path = pick(op, worktree_files(rg))
+        if not path:
+            return False
+        git(env, rg, "add", "-f", "--", path)
+        pgit(pg, "add", path)
+        for root in (rg, pg):
+            full = os.path.join(root, path)
+            with open(full, "rb") as f:
+                data = f.read()
+            with open(full, "wb") as f:
+                f.write(bytes(b ^ 0x20 for b in data) if data else b"")
+        return True
+
+    if kind == "file-to-dir":
+        # Replace a file with a directory of the same name.
+        path = pick(op, worktree_files(rg))
+        if not path:
+            return False
+        for root in (pg, rg):
+            os.unlink(os.path.join(root, path))
+            os.makedirs(os.path.join(root, path))
+            with open(os.path.join(root, path, op["name"]), "wb") as f:
+                f.write(b"now a directory\n")
         return True
 
     if kind == "commit":

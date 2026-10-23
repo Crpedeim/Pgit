@@ -11,6 +11,7 @@ A working reimplementation of Git's internals in a single Python library (~1,600
 ## Table of contents
 - [Interoperability (verified)](#interoperability-verified)
 - [Differential testing against real Git](#differential-testing-against-real-git)
+- [Crash safety](#crash-safety)
 - [How Git works — and what Pgit implements](#how-git-works--and-what-pgit-implements)
   - [1. Content-addressable object storage](#1-content-addressable-object-storage)
   - [2. The four object types](#2-the-four-object-types)
@@ -79,7 +80,7 @@ When the two disagree, the harness **shrinks** the sequence to a minimal reprodu
 - **Canaries:** at the end of every sequence it plants one extra change in a copy of Pgit's repo and requires the checks to notice it. If any canary slips through, the run fails.
 - **Mutants:** `tests/mutants.py` puts back, one at a time, each bug the harness found (below) and requires it to be caught.
 
-**Results:** 100 sequences (seeds 100000–100099): 3,237 operations, 863 commits, 100 of 100 canaries caught, **0 divergences**.
+**Results:** 1,000 sequences (seeds 100000–100999): 32,072 operations, 8,731 commits, every canary caught. That run found 3 more divergences, which were fixed (the racy-git and file-to-directory rows below). The mutation check catches every reintroduced bug.
 
 **Bugs it found and fixed** (each one is now a mutant):
 
@@ -102,6 +103,10 @@ When the two disagree, the harness **shrinks** the sequence to a minimal reprodu
 | `init` wrote `core.filemode = false`, so real Git ignored exec bits too | status |
 | `rm` crashed on a file already deleted from disk | crash |
 | `rm` left emptied directories behind | worktree |
+| `status` treated a file replaced by a directory as modified (or crashed opening it) | status |
+| Racy git: a file rewritten in the same second as `add` looked unchanged to Git, because Pgit didn't "smudge" racily clean entries | status |
+| `status` trusted timestamps of racily clean entries | status |
+| `add` kept a file and a directory with the same name in the index (after a file became a directory) | index |
 
 ```bash
 python3 tests/difftest.py                   # 50 random sequences
@@ -110,6 +115,37 @@ python3 tests/mutants.py                    # every reintroduced bug must be cau
 ```
 
 Both run in CI on every push.
+
+---
+
+## Crash safety
+
+A version control system has to survive being killed at any moment. Pgit originally wrote objects, the index and refs in place, so a crash mid-write left truncated files behind. It now follows Git's own protocols:
+
+- **Objects** are written to a temp file, fsynced, made read-only and **renamed into place** (`write_atomic`). An object file either doesn't exist or is complete, and leftover temp files are ignored by Git.
+- **The index and refs** use Git's **lockfile protocol** (`LockFile`): create `index.lock` with `O_EXCL`, write and fsync it, then rename it over `index`. Readers see the old file or the new one, never a mix. A second process can't take the lock, and `add`/`rm` hold it across the whole read-modify-write, so concurrent updates can't be lost.
+- **Ordering:** blobs, trees and the commit are all durable before the branch ref moves, so a ref can never point at a missing object.
+
+`tests/crashtest.py` proves it three ways:
+
+- **Crash injection at every disk change.** Pgit runs with its file APIs wrapped. The child dies right before its Nth disk change, or halfway through its Nth write (a torn write). Every crash point of `commit`, `add`, `rm` and `hash-object` is tried.
+- **Real `kill -9`** at random moments during `add` + `commit`.
+- **Concurrency:** 8 `pgit add`s started at once, 25 times.
+
+After every crash the repository must pass `git fsck --strict`. HEAD and the index must each be entirely before or entirely after the command, `pgit status` must still run, and rerunning the command (after removing a stale lock, as Git asks you to) must give the same result as a clean run.
+
+| | Before | After |
+|---|---|---|
+| Injected crashes leaving a broken repository | **668 of 718** | **0 of 1,032** |
+| Random `kill -9`s leaving a broken repository | **33 of 200** | **0 of 200** |
+| Concurrent `add`s: lost updates / crashes | **29 / 46** (of 200) | **0 / 0** (86 cleanly refused by `index.lock`) |
+
+(The "after" code has more crash points because each atomic write adds a temp file, an fsync and a rename.) This tests process crashes. Surviving power loss also depends on the `fsync` calls, which can't be exercised without a VM.
+
+```bash
+python3 tests/crashtest.py                  # all three modes
+python3 tests/crashtest.py --mode kill --kills 1000
+```
 
 ---
 
@@ -209,6 +245,7 @@ git cat-file -p <that-sha>                      # real git reads it
 - **Class-per-object-type with a shared base.** `GitObject` defines the `serialise`/`deserialise` contract; `GitBlob`, `GitTree`, `GitCommit`, `GitTag` implement it. `object_read` reads the type tag and constructs the right subclass polymorphically.
 - **Exact formats over convenient ones.** Trees store raw 20-byte SHAs (not hex); the index is packed binary; refs are plain files. Matching these exactly is what buys interoperability.
 - **Standard library only** — `hashlib` for SHA-1, `zlib` for compression, no external packages.
+- **Crash-safe writes.** Temp-file-and-rename for objects, Git's lockfile protocol for the index and refs, and objects made durable before any ref points at them.
 
 ---
 

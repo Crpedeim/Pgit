@@ -11,6 +11,7 @@ from math import ceil
 import os
 import re
 import sys
+import tempfile
 import zlib
 
 argparser = argparse.ArgumentParser(description="the git parser")
@@ -321,6 +322,76 @@ def object_read(repo , sha):
         
         return c(raw[y+1 :]) #??
     
+def fsync_dir(path):
+    """Make a rename in this directory durable."""
+    if os.name == "nt":
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_atomic(path, data):
+    """Write data to path so that a crash leaves either nothing or the
+    whole file: write a temp file, fsync it, then rename it into place."""
+    dirname = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(prefix="tmp_obj_", dir=dirname)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o444) # Objects are immutable, like in Git
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    fsync_dir(dirname)
+
+
+class LockFile(object):
+    """Git's lockfile protocol: create PATH.lock exclusively, write the new
+    content into it, then rename it over PATH.  Only one process can hold
+    the lock, and readers see either the old file or the new one."""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = path + ".lock"
+        self.file = None
+
+    def __enter__(self):
+        try:
+            fd = os.open(self.lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            raise Exception(f"Unable to create '{self.lock}': File exists.\n\n"
+                            "Another pgit process seems to be running in this repository,\n"
+                            "or a previous one crashed. If no other process is running,\n"
+                            "remove the file manually to continue.")
+        self.file = os.fdopen(fd, "wb")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.file.flush()
+            os.fsync(self.file.fileno())
+            self.file.close()
+            os.replace(self.lock, self.path)
+            fsync_dir(os.path.dirname(self.path))
+        else:
+            self.file.close()
+            os.unlink(self.lock)
+        return False
+
+
+def ref_write(repo, path, sha):
+    """Point a ref (a path inside .git) at sha, atomically."""
+    with LockFile(repo_file(repo, path, mkdir=True)) as lock:
+        lock.file.write((sha + "\n").encode("ascii"))
+
+
 def object_write(obj , repo):
 
         data = obj.serialise()
@@ -333,10 +404,8 @@ def object_write(obj , repo):
 
             path = repo_file(repo,"objects",sha[0:2],sha[2:],mkdir=True)
 
-            if not os.path.exists(path): #??
-                with open(path, 'wb') as f:
-
-                    f.write(zlib.compress(result))
+            if not os.path.exists(path):
+                write_atomic(path, zlib.compress(result))
         return sha
 
 
@@ -816,8 +885,7 @@ def tag_create(repo, name, ref, create_tag_object=False):
         ref_create(repo, "tags/" + name, sha)
 
 def ref_create(repo, ref_name, sha):
-    with open(repo_file(repo, "refs/" + ref_name), 'w') as fp:
-        fp.write(sha + "\n")
+    ref_write(repo, "refs/" + ref_name, sha)
 
 
 def cmd_rev_parse(args):
@@ -890,71 +958,83 @@ class _Sha1Writer:
         self.f.write(data)
 
 
-def index_write(repo, index):
-    with open(repo_file(repo, "index"), "wb") as raw:
-        f = _Sha1Writer(raw)
+def index_write(repo, index, lock=None):
+    """Write the index.  Pass the LockFile when the caller already holds
+    it (to make a read-modify-write atomic); otherwise one is taken here."""
+    if lock is None:
+        with LockFile(repo_file(repo, "index")) as lock:
+            return index_write(repo, index, lock)
 
-        # Git requires entries sorted by path bytes.
-        index.entries.sort(key=lambda e: e.name.encode("utf8"))
+    raw = lock.file
+    f = _Sha1Writer(raw)
 
-        # HEADER
+    # Racy git: a file changed in the same second as this index write
+    # would look unchanged to Git's stat check, which by default compares
+    # whole seconds.  Like Git, write such entries with size 0 so they
+    # get re-hashed.
+    index_mtime_s = os.fstat(raw.fileno()).st_mtime_ns // 10**9
 
-        # Write the magic bytes.
-        f.write(b"DIRC")
-        # Write version number.
-        f.write(index.version.to_bytes(4, "big"))
-        # Write the number of entries.
-        f.write(len(index.entries).to_bytes(4, "big"))
+    # Git requires entries sorted by path bytes.
+    index.entries.sort(key=lambda e: e.name.encode("utf8"))
 
-        # ENTRIES
+    # HEADER
 
-        idx = 0
-        for e in index.entries:
-            f.write(e.ctime[0].to_bytes(4, "big"))
-            f.write(e.ctime[1].to_bytes(4, "big"))
-            f.write(e.mtime[0].to_bytes(4, "big"))
-            f.write(e.mtime[1].to_bytes(4, "big"))
-            f.write(e.dev.to_bytes(4, "big"))
-            f.write(e.ino.to_bytes(4, "big"))
+    # Write the magic bytes.
+    f.write(b"DIRC")
+    # Write version number.
+    f.write(index.version.to_bytes(4, "big"))
+    # Write the number of entries.
+    f.write(len(index.entries).to_bytes(4, "big"))
 
-            # Mode
-            mode = (e.mode_type << 12) | e.mode_perms
-            f.write(mode.to_bytes(4, "big"))
+    # ENTRIES
 
-            f.write(e.uid.to_bytes(4, "big"))
-            f.write(e.gid.to_bytes(4, "big"))
+    idx = 0
+    for e in index.entries:
+        f.write(e.ctime[0].to_bytes(4, "big"))
+        f.write(e.ctime[1].to_bytes(4, "big"))
+        f.write(e.mtime[0].to_bytes(4, "big"))
+        f.write(e.mtime[1].to_bytes(4, "big"))
+        f.write(e.dev.to_bytes(4, "big"))
+        f.write(e.ino.to_bytes(4, "big"))
 
-            f.write(e.fsize.to_bytes(4, "big"))
-            # @FIXME Convert back to int.
-            f.write(int(e.sha, 16).to_bytes(20, "big"))
+        # Mode
+        mode = (e.mode_type << 12) | e.mode_perms
+        f.write(mode.to_bytes(4, "big"))
 
-            flag_assume_valid = 0x1 << 15 if e.flag_assume_valid else 0
+        f.write(e.uid.to_bytes(4, "big"))
+        f.write(e.gid.to_bytes(4, "big"))
 
-            name_bytes = e.name.encode("utf8")
-            bytes_len = len(name_bytes)
-            if bytes_len >= 0xFFF:
-                name_length = 0xFFF
-            else:
-                name_length = bytes_len
+        f.write((0 if e.mtime[0] >= index_mtime_s else e.fsize).to_bytes(4, "big"))
+        # @FIXME Convert back to int.
+        f.write(int(e.sha, 16).to_bytes(20, "big"))
 
-            # We merge back three pieces of data (two flags and the
-            # length of the name) on the same two bytes.
-            f.write((flag_assume_valid | e.flag_stage | name_length).to_bytes(2, "big"))
+        flag_assume_valid = 0x1 << 15 if e.flag_assume_valid else 0
 
-            # Write back the name, and a final 0x00.
-            f.write(name_bytes)
-            f.write((0).to_bytes(1, "big"))
+        name_bytes = e.name.encode("utf8")
+        bytes_len = len(name_bytes)
+        if bytes_len >= 0xFFF:
+            name_length = 0xFFF
+        else:
+            name_length = bytes_len
 
-            idx += 62 + len(name_bytes) + 1
+        # We merge back three pieces of data (two flags and the
+        # length of the name) on the same two bytes.
+        f.write((flag_assume_valid | e.flag_stage | name_length).to_bytes(2, "big"))
 
-            # Add padding if necessary.
-            if idx % 8 != 0:
-                pad = 8 - (idx % 8)
-                f.write((0).to_bytes(pad, "big"))
-                idx += pad
+        # Write back the name, and a final 0x00.
+        f.write(name_bytes)
+        f.write((0).to_bytes(1, "big"))
 
-        # TRAILER: SHA-1 of everything above, as real Git expects.
-        raw.write(f.h.digest())
+        idx += 62 + len(name_bytes) + 1
+
+        # Add padding if necessary.
+        if idx % 8 != 0:
+            pad = 8 - (idx % 8)
+            f.write((0).to_bytes(pad, "big"))
+            idx += pad
+
+    # TRAILER: SHA-1 of everything above, as real Git expects.
+    raw.write(f.h.digest())
 
 
 def index_read(repo):
@@ -1368,12 +1448,15 @@ def cmd_status_index_worktree(repo, index):
     # We now traverse the index, and compare real files with the cached
     # versions.
 
+    index_path = repo_file(repo, "index")
+    index_mtime = os.stat(index_path).st_mtime_ns if os.path.exists(index_path) else 0
+
     for entry in index.entries:
         full_path = os.path.join(repo.worktree, entry.name)
 
         # That file *name* is in the index
 
-        if not os.path.exists(full_path):
+        if not os.path.isfile(full_path): # Gone, or replaced by a directory
             print("  deleted: ", entry.name)
         else:
             stat = os.stat(full_path)
@@ -1385,9 +1468,13 @@ def cmd_status_index_worktree(repo, index):
             # Compare metadata
             ctime_ns = entry.ctime[0] * 10**9 + entry.ctime[1]
             mtime_ns = entry.mtime[0] * 10**9 + entry.mtime[1]
+            # Racily clean: changed too soon after the index was written for
+            # the timestamps to show it.
+            racy = entry.mtime[0] >= index_mtime // 10**9
             if mode_changed:
                 print("  modified:", entry.name)
-            elif (stat.st_ctime_ns != ctime_ns) or (stat.st_mtime_ns != mtime_ns):
+            elif (stat.st_ctime_ns != ctime_ns) or (stat.st_mtime_ns != mtime_ns) \
+                 or stat.st_size != entry.fsize or racy:
                 # If different, deep compare.
                 # @FIXME This *will* crash on symlinks to dir.
                 with open(full_path, "rb") as fd:
@@ -1425,9 +1512,14 @@ argsp = argsubparsers.add_parser("rm", help="Remove files from the working tree 
 argsp.add_argument("path", nargs="+", help="Files to remove")
 
 
-def rm(repo, paths, delete=True, skip_missing=False):
-    # Find and read the index
-    index = index_read(repo)
+def rm(repo, paths, delete=True, skip_missing=False, index=None):
+    # Without an index from the caller, lock, read, update and write it.
+    if index is None:
+        with LockFile(repo_file(repo, "index")) as lock:
+            index = index_read(repo)
+            rm(repo, paths, delete, skip_missing, index)
+            index_write(repo, index, lock)
+        return
 
     worktree = repo.worktree + os.sep
 
@@ -1473,9 +1565,8 @@ def rm(repo, paths, delete=True, skip_missing=False):
                 os.rmdir(parent)
                 parent = os.path.dirname(parent)
 
-    # Update the list of entries in the index, and write it back.
+    # Update the list of entries in the index; the caller writes it back.
     index.entries = kept_entries
-    index_write(repo, index)
 
 
 def cmd_rm(args):
@@ -1489,9 +1580,15 @@ argsp.add_argument("path", nargs="+", help="Files to add")
 
 
 def add(repo, paths, delete=True, skip_missing=False):
+    with LockFile(repo_file(repo, "index")) as lock:
+        index = index_read(repo)
+        add_to_index(repo, index, paths)
+        index_write(repo, index, lock)
 
+
+def add_to_index(repo, index, paths):
     # First remove all paths from the index, if they exist.
-    rm (repo, paths, delete=False, skip_missing=True)
+    rm (repo, paths, delete=False, skip_missing=True, index=index)
 
     worktree = repo.worktree + os.sep
 
@@ -1505,12 +1602,19 @@ def add(repo, paths, delete=True, skip_missing=False):
         relpath = os.path.relpath(abspath, repo.worktree)
         clean_paths.add((abspath,  relpath))
 
-    # Find and read the index.  It was modified by rm.  (This isn't
-    # optimal, good enough for wyag!)
-    #
-    # @FIXME, though: we could just move the index through
-    # commands instead of reading and writing it over again.
-    index = index_read(repo)
+    # A path can't be both a file and a directory.  Like git add, drop
+    # entries for a file that is now a directory of the new path, and for
+    # files under a directory that is now this file.
+    conflicts = set()
+    for (_, relpath) in clean_paths:
+        parent = os.path.dirname(relpath)
+        while parent:
+            conflicts.add(parent)
+            parent = os.path.dirname(parent)
+    new_files = set(relpath + "/" for (_, relpath) in clean_paths)
+    index.entries = [e for e in index.entries
+                     if e.name not in conflicts
+                     and not any(e.name.startswith(d) for d in new_files)]
 
     for (abspath, relpath) in clean_paths:
         with open(abspath, "rb") as fd:
@@ -1521,19 +1625,14 @@ def add(repo, paths, delete=True, skip_missing=False):
             # Git only tracks the executable bit: 100755 or 100644.
             mode_perms = 0o755 if stat.st_mode & 0o100 else 0o644
 
-            ctime_s = int(stat.st_ctime)
-            ctime_ns = stat.st_ctime_ns % 10**9
-            mtime_s = int(stat.st_mtime)
-            mtime_ns = stat.st_mtime_ns % 10**9
+            ctime_s, ctime_ns = divmod(stat.st_ctime_ns, 10**9)
+            mtime_s, mtime_ns = divmod(stat.st_mtime_ns, 10**9)
 
             entry = GitIndexEntry(ctime=(ctime_s, ctime_ns), mtime=(mtime_s, mtime_ns), dev=stat.st_dev, ino=stat.st_ino,
                                   mode_type=0b1000, mode_perms=mode_perms, uid=stat.st_uid, gid=stat.st_gid,
                                   fsize=stat.st_size, sha=sha, flag_assume_valid=False,
                                   flag_stage=False, name=relpath)
             index.entries.append(entry)
-
-    # Write the index back
-    index_write(repo, index)
 
 
 
@@ -1675,12 +1774,12 @@ def cmd_commit(args):
 
     # Update HEAD so our commit is now the tip of the active branch.
     active_branch = branch_get_active(repo)
+    # The commit and its trees are already durable, so moving the ref last
+    # means a crash can never leave it pointing at a missing object.
     if active_branch: # If we're on a branch, we update refs/heads/BRANCH
-        with open(repo_file(repo, os.path.join("refs/heads", active_branch)), "w") as fd:
-            fd.write(commit + "\n")
+        ref_write(repo, os.path.join("refs/heads", active_branch), commit)
     else: # Otherwise, we update HEAD itself.
-        with open(repo_file(repo, "HEAD"), "w") as fd:
-            fd.write("\n")
+        ref_write(repo, "HEAD", commit)
               
 
 
