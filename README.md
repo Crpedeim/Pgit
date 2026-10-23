@@ -80,7 +80,7 @@ When the two disagree, the harness **shrinks** the sequence to a minimal reprodu
 - **Canaries:** at the end of every sequence it plants one extra change in a copy of Pgit's repo and requires the checks to notice it. If any canary slips through, the run fails.
 - **Mutants:** `tests/mutants.py` puts back, one at a time, each bug the harness found (below) and requires it to be caught.
 
-**Results:** 1,000 sequences (seeds 100000–100999): 32,072 operations, 8,731 commits, every canary caught. That run found 3 more divergences, which were fixed (the racy-git and file-to-directory rows below). The mutation check catches every reintroduced bug.
+**Results** on the current code: 300 sequences (seeds 400000–400299), 9,734 operations, 2,242 commits, 300 of 300 canaries caught, **0 divergences**; the mutation check catches **20 of 20** reintroduced bugs. An earlier 1,000-sequence run (32,072 operations, 8,731 commits) is what found the racy-git and file-to-directory bugs below.
 
 **Bugs it found and fixed** (each one is now a mutant):
 
@@ -137,7 +137,7 @@ After every crash the repository must pass `git fsck --strict`. HEAD and the ind
 |---|---|---|
 | Injected crashes leaving a broken repository | **668 of 718** | **0 of 1,032** |
 | Random `kill -9`s leaving a broken repository | **33 of 200** | **0 of 200** |
-| Concurrent `add`s: lost updates / crashes | **29 / 46** (of 200) | **0 / 0** (86 cleanly refused by `index.lock`) |
+| Concurrent `add`s: lost updates / crashes | **29 / 46** (of 200) | **0 / 0** (the rest cleanly refused by `index.lock`) |
 
 (The "after" code has more crash points because each atomic write adds a temp file, an fsync and a rename.) This tests process crashes. Surviving power loss also depends on the `fsync` calls, which can't be exercised without a VM.
 
