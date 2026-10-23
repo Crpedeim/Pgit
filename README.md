@@ -81,7 +81,7 @@ When the two disagree, the harness **shrinks** the sequence to a minimal reprodu
 - **Canaries:** at the end of every sequence it plants one extra change in a copy of Pgit's repo and requires the checks to notice it. If any canary slips through, the run fails.
 - **Mutants:** `tests/mutants.py` puts back, one at a time, each bug the harness found (below) and requires it to be caught.
 
-**Results** on the current code: 300 sequences (seeds 400000–400299), 9,734 operations, 2,242 commits, 300 of 300 canaries caught, **0 divergences**; the mutation check catches **20 of 20** reintroduced bugs. An earlier 1,000-sequence run (32,072 operations, 8,731 commits) is what found the racy-git and file-to-directory bugs below.
+**Results** on the current code: 300 sequences (seeds 800000–800299), 9,682 operations, 1,366 commits, 300 of 300 canaries caught, **0 divergences**; the mutation check catches **31 of 31** reintroduced bugs (across this harness, the crash-safety fixes and the pack reader). An earlier 1,000-sequence run (32,072 operations, 8,731 commits) is what found the racy-git and file-to-directory bugs below.
 
 **Bugs it found and fixed** (each one is now a mutant):
 

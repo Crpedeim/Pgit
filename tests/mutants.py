@@ -74,7 +74,7 @@ MUTANTS = [
      '''        pass'''),
 
     ("check-ignore treats an existing directory as a file",
-     '''        is_dir = os.path.isdir(os.path.join(repo.worktree, path))''',
+     '''        is_dir = os.path.isdir(full) and not os.path.islink(full)''',
      '''        is_dir = False'''),
 
     ("add ignores the executable bit",
