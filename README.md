@@ -1,5 +1,7 @@
 # Pgit — Git, Reimplemented From Scratch in Python
 
+[![difftest](https://github.com/Crpedeim/Pgit/actions/workflows/difftest.yml/badge.svg)](https://github.com/Crpedeim/Pgit/actions/workflows/difftest.yml)
+
 A working reimplementation of Git's internals in a single Python library (~1,600 lines). Not a wrapper around the `git` binary — a from-scratch implementation of the **object database**, **content-addressable storage**, the **staging index**, the **reference system**, and `.gitignore` matching, following the structure of Thibault Polge's *Write Yourself a Git*.
 
 **The defining property: Pgit is byte-for-byte interoperable with real Git.** Objects it writes are read by real `git`; repositories real `git` creates are read by Pgit — because Pgit implements Git's exact on-disk formats rather than approximating them.
@@ -8,6 +10,7 @@ A working reimplementation of Git's internals in a single Python library (~1,600
 
 ## Table of contents
 - [Interoperability (verified)](#interoperability-verified)
+- [Differential testing against real Git](#differential-testing-against-real-git)
 - [How Git works — and what Pgit implements](#how-git-works--and-what-pgit-implements)
   - [1. Content-addressable object storage](#1-content-addressable-object-storage)
   - [2. The four object types](#2-the-four-object-types)
@@ -56,6 +59,60 @@ Identical SHAs are the strong signal: because Git addresses objects by the hash 
 
 ---
 
+## Differential testing against real Git
+
+Hand-written examples only prove the cases someone thought of. `tests/difftest.py` generates random sequences of operations (writing files in nested directories, `.gitignore` rules, `chmod +x`, deletes, `add`, `rm`, `commit`) and runs each sequence through **Pgit and real Git side by side**, in a random timezone. After every operation it requires the two to agree on:
+
+| Check | What must match |
+|---|---|
+| worktree | the files and directories each tool leaves on disk |
+| index | `git ls-files -s` on Pgit's index vs on Git's index |
+| status | `pgit status` vs `git status`, run in **both** repos, so each tool reads the other's index |
+| ignore | `pgit check-ignore` vs `git check-ignore --no-index` over a pool of tricky paths |
+| commit | commit SHAs: Pgit's commit is replayed in Git with the same author and timestamp, so the bytes must be identical |
+| fsck | `git fsck --strict` accepts Pgit's repository |
+| read-back | Pgit's `ls-tree`, `cat-file` and `log` on Git's repository vs Git's own output |
+
+When the two disagree, the harness **shrinks** the sequence to a minimal reproduction (usually 1–5 operations) and saves it as JSON to replay with `--replay`.
+
+**Testing the tester.** A checker that never fails proves nothing, so the harness checks itself two ways:
+- **Canaries:** at the end of every sequence it plants one extra change in a copy of Pgit's repo and requires the checks to notice it. If any canary slips through, the run fails.
+- **Mutants:** `tests/mutants.py` puts back, one at a time, each bug the harness found (below) and requires it to be caught.
+
+**Results:** 100 sequences (seeds 100000–100099): 3,237 operations, 863 commits, 100 of 100 canaries caught, **0 divergences**.
+
+**Bugs it found and fixed** (each one is now a mutant):
+
+| Bug | Caught by |
+|---|---|
+| `status` crashed in a repo with no commits | crash |
+| Subtrees written with mode `040000` instead of `40000`, so tree SHAs didn't match Git's | commit |
+| Subtrees sorted as `name` instead of `name/` | status |
+| Index written without its SHA-1 trailer (`git fsck`: "index file corrupt") | fsck |
+| Index entries not sorted by path ("unordered stage entries") | index |
+| Malformed timezone for negative UTC offsets (e.g. `--500`) | commit |
+| `.gitignore` read from the index instead of the working tree | ignore |
+| Ignore patterns matched with `fnmatch`: `*` crossed `/`, no anchoring | ignore |
+| Directory-only patterns (`build/`) not handled | ignore |
+| Files inside an ignored directory could be re-included | ignore |
+| `check-ignore` treated an existing directory as a file, so `build/` didn't match `build` | ignore |
+| `add` ignored the executable bit (always `100644`) | index |
+| `status` missed `chmod +x` in the working tree | status |
+| `status` missed a staged mode change | status |
+| `init` wrote `core.filemode = false`, so real Git ignored exec bits too | status |
+| `rm` crashed on a file already deleted from disk | crash |
+| `rm` left emptied directories behind | worktree |
+
+```bash
+python3 tests/difftest.py                   # 50 random sequences
+python3 tests/difftest.py --runs 1000 --seed 1
+python3 tests/mutants.py                    # every reintroduced bug must be caught
+```
+
+Both run in CI on every push.
+
+---
+
 ## How Git works — and what Pgit implements
 
 ### 1. Content-addressable object storage
@@ -96,7 +153,7 @@ Name resolution (`object_resolve` / `object_find`) is richer than it looks — i
 
 ### 5. .gitignore matching
 
-`check-ignore` implements Git's actual precedence rules, not a naive glob. It reads rules from `.git/info/exclude` and from `.gitignore` files tracked in the index, supports **negation** (`!pattern`), and resolves **scoped** rules (a `.gitignore` applies to its own directory subtree) versus **absolute** rules, applying them in Git's priority order.
+`check-ignore` implements the rules from gitignore(5), not a naive glob. Each pattern is compiled to a regex: `*` and `?` never cross `/`, a slash at the start or middle **anchors** the pattern to its `.gitignore`'s directory (otherwise it matches a name at any depth), a trailing `/` matches **directories only**, `**` matches across directories, and `!pattern` **negates**. Rules come from the global ignore file, `.git/info/exclude`, and every `.gitignore` in the working tree. A deeper `.gitignore` beats a shallower one, and within a file the last matching pattern wins. Like Git, nothing inside an ignored directory can be re-included.
 
 ### 6. `status`: three-way comparison
 

@@ -6,7 +6,6 @@ try:
 except ModuleNotFoundError:
     print("module notm found")
     exit
-from fnmatch import fnmatch
 import hashlib
 from math import ceil
 import os
@@ -239,7 +238,8 @@ def repo_default_config():
     ret.add_section("core")
    
     ret.set("core", "repositoryformatversion", "0")
-    ret.set("core", "filemode", "false")
+    # Like git init: track the executable bit, except on Windows.
+    ret.set("core", "filemode", "false" if os.name == "nt" else "true")
     ret.set("core", "bare", "false")
 
     return ret
@@ -1093,18 +1093,84 @@ def cmd_ls_files(args):
 
 
 
+class GitIgnoreRule(object):
+    def __init__(self, regex, negate, dir_only):
+        self.regex = regex       # Compiled pattern
+        self.negate = negate     # "!pattern": re-include
+        self.dir_only = dir_only # "pattern/": only matches directories
+
+
+def gitignore_translate(pattern):
+    """Translate a gitignore glob into a regex, following gitignore(5)."""
+    # A slash at the start or in the middle anchors the pattern to the
+    # .gitignore's directory.  Otherwise it matches a name at any depth.
+    anchored = "/" in pattern
+    if pattern.startswith("/"):
+        pattern = pattern[1:]
+
+    out = ""
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if pattern.startswith("**/", i) and (i == 0 or pattern[i-1] == "/"):
+            out += "(?:.*/)?"    # Leading "**/" and "/**/": zero or more dirs
+            i += 3
+        elif pattern.startswith("**", i) and i + 2 == len(pattern) and (i == 0 or pattern[i-1] == "/"):
+            out += ".*"          # Trailing "/**": everything inside
+            i += 2
+        elif c == "*":
+            out += "[^/]*"
+            i += 1
+        elif c == "?":
+            out += "[^/]"
+            i += 1
+        elif c == "[":
+            end = pattern.find("]", i + 2)
+            if end == -1:
+                out += re.escape(c)
+                i += 1
+            else:
+                body = pattern[i+1:end]
+                if body[0] == "!":
+                    body = "^" + body[1:]
+                out += "[" + body.replace("\\", "\\\\") + "]"
+                i = end + 1
+        elif c == "\\" and i + 1 < len(pattern):
+            out += re.escape(pattern[i+1])
+            i += 2
+        else:
+            out += re.escape(c)
+            i += 1
+
+    if anchored:
+        return re.compile(out + r"\Z", re.S)
+    return re.compile(r"(?:.*/)?" + out + r"\Z", re.S)
+
+
 def gitignore_parse1(raw):
-    raw = raw.strip() # Remove leading/trailing spaces
+    raw = raw.rstrip("\n\r")
+
+    # Trailing spaces are ignored unless escaped with a backslash.
+    while raw.endswith(" ") and not raw.endswith("\\ "):
+        raw = raw[:-1]
 
     if not raw or raw[0] == "#":
         return None
-    elif raw[0] == "!":
-        return (raw[1:], False)
+
+    negate = False
+    if raw[0] == "!":
+        negate = True
+        raw = raw[1:]
     elif raw[0] == "\\":
-        return (raw[1:], True)
-    else:
-        return (raw, True)
-    
+        raw = raw[1:]
+
+    dir_only = raw.endswith("/")
+    raw = raw.rstrip("/")
+    if not raw:
+        return None
+
+    return GitIgnoreRule(gitignore_translate(raw), negate, dir_only)
+
 
 def gitignore_parse(lines):
     ret = list()
@@ -1122,20 +1188,14 @@ class GitIgnore(object):
     scoped = None
 
     def __init__(self, absolute, scoped):
-        self.absolute = absolute
-        self.scoped = scoped
+        self.absolute = absolute # Rules from info/exclude and the global ignore file
+        self.scoped = scoped     # Directory -> rules from its .gitignore
 
 
 def gitignore_read(repo):
     ret = GitIgnore(absolute=list(), scoped=dict())
 
-    # Read local configuration in .git/info/exclude
-    repo_file = os.path.join(repo.gitdir, "info/exclude")
-    if os.path.exists(repo_file):
-        with open(repo_file, "r") as f:
-            ret.absolute.append(gitignore_parse(f.readlines()))
-
-    # Global configuration
+    # Global configuration (lowest precedence)
     if "XDG_CONFIG_HOME" in os.environ:
         config_home = os.environ["XDG_CONFIG_HOME"]
     else:
@@ -1144,59 +1204,71 @@ def gitignore_read(repo):
 
     if os.path.exists(global_file):
         with open(global_file, "r") as f:
-            ret.absolute.append(gitignore_parse(f.readlines()))
+            ret.absolute += gitignore_parse(f.readlines())
 
-    # .gitignore files in the index
-    index = index_read(repo)
+    # Read local configuration in .git/info/exclude
+    repo_file = os.path.join(repo.gitdir, "info/exclude")
+    if os.path.exists(repo_file):
+        with open(repo_file, "r") as f:
+            ret.absolute += gitignore_parse(f.readlines())
 
-    for entry in index.entries:
-        if entry.name == ".gitignore" or entry.name.endswith("/.gitignore"):
-            dir_name = os.path.dirname(entry.name)
-            contents = object_read(repo, entry.sha)
-            lines = contents.blobdata.decode("utf8").splitlines()
-            ret.scoped[dir_name] = gitignore_parse(lines)
+    # .gitignore files in the working tree, like real Git
+    for (root, dirs, files) in os.walk(repo.worktree):
+        if root == repo.worktree and ".git" in dirs:
+            dirs.remove(".git")
+        if ".gitignore" in files:
+            dir_name = os.path.relpath(root, repo.worktree)
+            if dir_name == ".":
+                dir_name = ""
+            with open(os.path.join(root, ".gitignore"), "r", encoding="utf8", errors="replace") as f:
+                ret.scoped[dir_name] = gitignore_parse(f.readlines())
     return ret
 
 
-def check_ignore1(rules, path):
+def check_ignore1(rules, path, is_dir):
+    # Within a set of rules, the last matching pattern wins.
     result = None
-    for (pattern, value) in rules:
-        if fnmatch(path, pattern):
-            result = value
+    for rule in rules:
+        if rule.dir_only and not is_dir:
+            continue
+        if rule.regex.match(path):
+            result = not rule.negate
     return result
 
 
-def check_ignore_scoped(rules, path):
+def check_ignore_path(rules, path, is_dir):
+    # A .gitignore deeper in the tree beats one higher up, which beats
+    # info/exclude and the global file.
     parent = os.path.dirname(path)
     while True:
-        if parent in rules:
-            result = check_ignore1(rules[parent], path)
+        if parent in rules.scoped:
+            relpath = path[len(parent)+1:] if parent else path
+            result = check_ignore1(rules.scoped[parent], relpath, is_dir)
             if result != None:
                 return result
         if parent == "":
             break
         parent = os.path.dirname(parent)
-    return None
+
+    return check_ignore1(rules.absolute, path, is_dir) or False
 
 
-def check_ignore_absolute(rules, path):
-    parent = os.path.dirname(path)
-    for ruleset in rules:
-        result = check_ignore1(ruleset, path)
-        if result != None:
-            return result
-    return False # This is a reasonable default at this point
-
-
-def check_ignore(rules, path):
+def check_ignore(rules, path, is_dir=False):
     if os.path.isabs(path):
         raise Exception("This function requires path to be relative to the repository's root")
 
-    result = check_ignore_scoped(rules.scoped, path)
-    if result != None:
-        return result
+    if path.endswith("/"):
+        path = path.rstrip("/")
+        is_dir = True
 
-    return check_ignore_absolute(rules.absolute, path)
+    # Git doesn't descend into ignored directories, so nothing inside
+    # one can be re-included.
+    parts = path.split("/")
+    for i in range(1, len(parts)):
+        if check_ignore_path(rules, "/".join(parts[:i]), True):
+            return True
+
+    return check_ignore_path(rules, path, is_dir)
 
 
 
@@ -1204,7 +1276,9 @@ def cmd_check_ignore(args):
     repo = repo_find()
     rules = gitignore_read(repo)
     for path in args.path:
-        if check_ignore(rules, path):
+        # Like Git, an existing directory matches directory-only patterns.
+        is_dir = os.path.isdir(os.path.join(repo.worktree, path))
+        if check_ignore(rules, path, is_dir):
             print(path)
 
 
@@ -1250,7 +1324,7 @@ def tree_to_dict(repo, ref, prefix=""):
         if is_subtree:
             ret.update(tree_to_dict(repo, leaf.sha, full_path))
         else:
-            ret[full_path] = leaf.sha
+            ret[full_path] = (leaf.mode.lstrip(b"0"), leaf.sha)
     return ret
 
 
@@ -1259,8 +1333,9 @@ def cmd_status_head_index(repo, index):
 
     head = tree_to_dict(repo, "HEAD")
     for entry in index.entries:
+        mode = f"{entry.mode_type:o}{entry.mode_perms:04o}".encode("ascii")
         if entry.name in head:
-            if head[entry.name] != entry.sha:
+            if head[entry.name] != (mode, entry.sha):
                 print("  modified:", entry.name)
             del head[entry.name] # Delete the key
         else:
@@ -1303,10 +1378,16 @@ def cmd_status_index_worktree(repo, index):
         else:
             stat = os.stat(full_path)
 
+            # The executable bit is part of the file's tracked state.
+            wt_perms = 0o755 if stat.st_mode & 0o100 else 0o644
+            mode_changed = entry.mode_type == 0b1000 and entry.mode_perms != wt_perms
+
             # Compare metadata
             ctime_ns = entry.ctime[0] * 10**9 + entry.ctime[1]
             mtime_ns = entry.mtime[0] * 10**9 + entry.mtime[1]
-            if (stat.st_ctime_ns != ctime_ns) or (stat.st_mtime_ns != mtime_ns):
+            if mode_changed:
+                print("  modified:", entry.name)
+            elif (stat.st_ctime_ns != ctime_ns) or (stat.st_mtime_ns != mtime_ns):
                 # If different, deep compare.
                 # @FIXME This *will* crash on symlinks to dir.
                 with open(full_path, "rb") as fd:
@@ -1384,7 +1465,13 @@ def rm(repo, paths, delete=True, skip_missing=False):
     # Physically delete paths from filesystem.
     if delete:
         for path in remove:
-            os.unlink(path)
+            if os.path.lexists(path): # It may already be gone from the worktree
+                os.unlink(path)
+            # Like git, remove directories this leaves empty.
+            parent = os.path.dirname(path)
+            while parent != repo.worktree and os.path.isdir(parent) and not os.listdir(parent):
+                os.rmdir(parent)
+                parent = os.path.dirname(parent)
 
     # Update the list of entries in the index, and write it back.
     index.entries = kept_entries
@@ -1431,13 +1518,16 @@ def add(repo, paths, delete=True, skip_missing=False):
 
             stat = os.stat(abspath)
 
+            # Git only tracks the executable bit: 100755 or 100644.
+            mode_perms = 0o755 if stat.st_mode & 0o100 else 0o644
+
             ctime_s = int(stat.st_ctime)
             ctime_ns = stat.st_ctime_ns % 10**9
             mtime_s = int(stat.st_mtime)
             mtime_ns = stat.st_mtime_ns % 10**9
 
             entry = GitIndexEntry(ctime=(ctime_s, ctime_ns), mtime=(mtime_s, mtime_ns), dev=stat.st_dev, ino=stat.st_ino,
-                                  mode_type=0b1000, mode_perms=0o644, uid=stat.st_uid, gid=stat.st_gid,
+                                  mode_type=0b1000, mode_perms=mode_perms, uid=stat.st_uid, gid=stat.st_gid,
                                   fsize=stat.st_size, sha=sha, flag_assume_valid=False,
                                   flag_stage=False, name=relpath)
             index.entries.append(entry)
