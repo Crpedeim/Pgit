@@ -424,7 +424,7 @@ def object_find(repo, name, fmt=None, follow=True):
 
     sha = sha[0]
 
-    if not fmt:
+    if not fmt or sha is None: # None: HEAD on a branch with no commits yet
         return sha
 
     while True:
@@ -624,7 +624,7 @@ def tree_parse(raw):
 
 
 def tree_leaf_sort_key(leaf):
-    if leaf.mode.startswith(b"4"):
+    if leaf.mode.lstrip(b"0").startswith(b"4"):
         return leaf.path + "/"
     else:
         return leaf.path
@@ -633,7 +633,8 @@ def tree_serialize(obj):
     obj.items.sort(key=tree_leaf_sort_key)
     ret = b''
     for i in obj.items:
-        ret += i.mode
+        # Git writes "40000", not "040000", for subtrees
+        ret += i.mode.lstrip(b"0")
         ret += b' '
         ret += i.path.encode("utf8")
         ret += b'\x00'
@@ -878,8 +879,23 @@ class GitIndex (object):
         self.entries = entries
 
 
+class _Sha1Writer:
+    """Wraps a file, hashing everything written so the SHA-1 trailer can be appended."""
+    def __init__(self, f):
+        self.f = f
+        self.h = hashlib.sha1()
+
+    def write(self, data):
+        self.h.update(data)
+        self.f.write(data)
+
+
 def index_write(repo, index):
-    with open(repo_file(repo, "index"), "wb") as f:
+    with open(repo_file(repo, "index"), "wb") as raw:
+        f = _Sha1Writer(raw)
+
+        # Git requires entries sorted by path bytes.
+        index.entries.sort(key=lambda e: e.name.encode("utf8"))
 
         # HEADER
 
@@ -936,6 +952,9 @@ def index_write(repo, index):
                 pad = 8 - (idx % 8)
                 f.write((0).to_bytes(pad, "big"))
                 idx += pad
+
+        # TRAILER: SHA-1 of everything above, as real Git expects.
+        raw.write(f.h.digest())
 
 
 def index_read(repo):
@@ -1213,6 +1232,8 @@ def cmd_status_branch(repo):
 def tree_to_dict(repo, ref, prefix=""):
     ret = dict()
     tree_sha = object_find(repo, ref, fmt=b"tree")
+    if tree_sha is None: # No commits yet
+        return ret
     tree = object_read(repo, tree_sha)
 
     for leaf in tree.items:
@@ -1534,9 +1555,9 @@ def commit_create(repo, tree, parent, author, timestamp, message):
     message = message.strip() + "\n"
     # Format timezone
     offset = int(timestamp.astimezone().utcoffset().total_seconds())
-    hours = offset // 3600
-    minutes = (offset % 3600) // 60
-    tz = "{}{:02}{:02}".format("+" if offset > 0 else "-", hours, minutes)
+    hours = abs(offset) // 3600
+    minutes = (abs(offset) % 3600) // 60
+    tz = "{}{:02}{:02}".format("+" if offset >= 0 else "-", hours, minutes)
 
     author = author + timestamp.strftime(" %s ") + tz
 
