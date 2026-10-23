@@ -1448,9 +1448,6 @@ def cmd_status_index_worktree(repo, index):
     # We now traverse the index, and compare real files with the cached
     # versions.
 
-    index_path = repo_file(repo, "index")
-    index_mtime = os.stat(index_path).st_mtime_ns if os.path.exists(index_path) else 0
-
     for entry in index.entries:
         full_path = os.path.join(repo.worktree, entry.name)
 
@@ -1468,13 +1465,12 @@ def cmd_status_index_worktree(repo, index):
             # Compare metadata
             ctime_ns = entry.ctime[0] * 10**9 + entry.ctime[1]
             mtime_ns = entry.mtime[0] * 10**9 + entry.mtime[1]
-            # Racily clean: changed too soon after the index was written for
-            # the timestamps to show it.
-            racy = entry.mtime[0] >= index_mtime // 10**9
+            # A racily clean entry was smudged to size 0 by index_write, so
+            # the size check below makes it get re-hashed.
             if mode_changed:
                 print("  modified:", entry.name)
             elif (stat.st_ctime_ns != ctime_ns) or (stat.st_mtime_ns != mtime_ns) \
-                 or stat.st_size != entry.fsize or racy:
+                 or stat.st_size != entry.fsize:
                 # If different, deep compare.
                 # @FIXME This *will* crash on symlinks to dir.
                 with open(full_path, "rb") as fd:

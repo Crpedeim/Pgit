@@ -235,6 +235,18 @@ def apply_op(env, op, pg, rg):
                                if os.path.isfile(os.path.join(rg, p))))
         if not paths:
             return False
+        # Git 2.43 quirk: when a tracked file sits two or more levels above
+        # an added path, git add keeps both entries and the index can't be
+        # committed ("You have both a and a/b/c").  Git is no reference
+        # there, so skip it.  (One level up, Git replaces the entry, and so
+        # does Pgit.)
+        tracked = index_paths(env, rg)
+        for path in paths:
+            ancestor = os.path.dirname(os.path.dirname(path))
+            while ancestor:
+                if ancestor in tracked:
+                    return False
+                ancestor = os.path.dirname(ancestor)
         # -f: Pgit's add doesn't consult ignore rules, so Git mustn't either.
         git(env, rg, "add", "-f", "--", *paths)
         pgit(pg, "add", *paths)

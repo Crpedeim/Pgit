@@ -105,7 +105,6 @@ When the two disagree, the harness **shrinks** the sequence to a minimal reprodu
 | `rm` left emptied directories behind | worktree |
 | `status` treated a file replaced by a directory as modified (or crashed opening it) | status |
 | Racy git: a file rewritten in the same second as `add` looked unchanged to Git, because Pgit didn't "smudge" racily clean entries | status |
-| `status` trusted timestamps of racily clean entries | status |
 | `add` kept a file and a directory with the same name in the index (after a file became a directory) | index |
 
 ```bash

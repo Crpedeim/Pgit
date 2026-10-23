@@ -101,10 +101,6 @@ MUTANTS = [
      '''        f.write((0 if e.mtime[0] >= index_mtime_s else e.fsize).to_bytes(4, "big"))''',
      '''        f.write(e.fsize.to_bytes(4, "big"))'''),
 
-    ("status trusts timestamps of racily clean entries",
-     '''            racy = entry.mtime[0] >= index_mtime // 10**9''',
-     '''            racy = False'''),
-
     ("status treats a file replaced by a directory as modified",
      '''        if not os.path.isfile(full_path): # Gone, or replaced by a directory''',
      '''        if not os.path.exists(full_path):'''),
