@@ -261,6 +261,10 @@ def check_after_crash(repo, before, after, clean_shape, args):
              for f in fs if f.endswith(".lock")]
     for lock in locks:
         os.unlink(lock)
+    # A crash after the command's last change leaves it complete; rerunning
+    # a commit then would just make a second one.
+    if args[0] == "commit" and commit_shape(repo) == clean_shape:
+        return len(locks)
     rerun = pgit(repo, *args, check=False)
     if rerun.returncode != 0:
         raise Failure("recover", rerun.stderr.strip().splitlines()[-1:])
