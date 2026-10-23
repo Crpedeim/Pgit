@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Checks that the differential tester catches real bugs.
 
-Each mutant puts back one bug that was found and fixed in libwyag.py, then
-runs difftest.py on the mutated copy. Every mutant must be caught; if one
-survives, the tester has a blind spot.
+Each mutant puts back one bug that was found and fixed in libwyag.py (or,
+for the pack reader, breaks one rule of the pack format), then runs
+difftest.py or packtest.py on the mutated copy. Every mutant must be
+caught; if one survives, the tester has a blind spot.
 
 Usage:
   python3 tests/mutants.py            # all mutants, 40 sequences each
@@ -20,7 +21,8 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# (description, code as fixed, code with the bug put back)
+# (description, code as fixed, code with the bug put back[, tester])
+# The tester is difftest.py unless given.
 MUTANTS = [
     ("status crashes before the first commit",
      '''    if not fmt or sha is None: # None: HEAD on a branch with no commits yet
@@ -120,23 +122,65 @@ MUTANTS = [
      '''            while False:'''),
 ]
 
+PACK_MUTANTS = [
+    # Caught by difftest's gc operation, which packs a repository mid-sequence.
+    ("object lookup ignores packfiles",
+     '''            found = pack.read(sha)''',
+     '''            found = None'''),
 
-def run(source, args):
-    """Run difftest on a copy of libwyag.py with this source. Returns the
+    ("ref lookup ignores packed-refs",
+     '''        return packed_refs(repo).get(name)''',
+     '''        return None'''),
+
+    ("loose lookup crashes when objects/xx/ doesn't exist",
+     '''    path = repo_path(repo,"objects",sha[0:2],sha[2:])''',
+     '''    path = repo_file(repo,"objects",sha[0:2],sha[2:])'''),
+
+    # Caught by packtest.
+    ("OFS_DELTA offset decoded without Git's +1 per byte",
+     '''                    rel = ((rel + 1) << 7) | (c & 0x7f)''',
+     '''                    rel = (rel << 7) | (c & 0x7f)''', "packtest"),
+
+    ("delta copy of size 0 not read as 0x10000",
+     '''            out += base[offset : offset + (size or 0x10000)]''',
+     '''            out += base[offset : offset + size]''', "packtest"),
+
+    ("REF_DELTA base SHA not skipped",
+     '''                deltas.append((offset, self._inflate(pos + 20, size)))''',
+     '''                deltas.append((offset, self._inflate(pos, size)))''', "packtest"),
+
+    ("abbreviated SHAs don't search packs",
+     '''            for sha in pack.index.prefix(name):''',
+     '''            for sha in []:''', "packtest"),
+
+    ("odd-length prefix search stops at the first non-match",
+     '''        while i < hi and self.names[i].startswith(start):''',
+     '''        while i < hi and self.names[i].hex().startswith(hexprefix):''', "packtest"),
+]
+
+MUTANTS += PACK_MUTANTS
+
+
+def run(source, args, tester="difftest"):
+    """Run a tester on a copy of libwyag.py with this source. Returns the
     name of the first check that failed, or None if none did."""
     work = tempfile.mkdtemp(prefix="pgit-mutant-")
     try:
         os.makedirs(os.path.join(work, "tests"))
         with open(os.path.join(work, "libwyag.py"), "w") as f:
             f.write(source)
-        shutil.copy(os.path.join(ROOT, "tests", "difftest.py"),
-                    os.path.join(work, "tests"))
-        p = subprocess.run([sys.executable, "tests/difftest.py",
-                            "--runs", str(args.runs), "--seed", str(args.seed)],
-                           cwd=work, capture_output=True, text=True)
+        for name in ("wyag", "tests/difftest.py", "tests/packtest.py"):
+            shutil.copy(os.path.join(ROOT, name), os.path.join(work, name))
+        if tester == "difftest":
+            cmd = ["tests/difftest.py", "--runs", str(args.runs), "--seed", str(args.seed)]
+        else:
+            cmd = ["tests/packtest.py", "--commits", "120"]
+        p = subprocess.run([sys.executable, *cmd], cwd=work, capture_output=True, text=True)
         for line in p.stdout.splitlines():
             if line.startswith("DIVERGENCE"):
                 return line.split("]")[0].split("[")[1]
+            if line.strip().startswith("FAIL"):
+                return "packtest"
         return "error" if p.returncode != 0 else None
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -152,18 +196,19 @@ def main():
         source = f.read()
 
     # The unmutated code must pass, or every mutant would look "caught".
-    if run(source, args) is not None:
-        print("BASELINE FAILS: fix difftest divergences before checking mutants")
-        return 1
+    for tester in ("difftest", "packtest"):
+        if run(source, args, tester) is not None:
+            print(f"BASELINE FAILS: fix {tester} failures before checking mutants")
+            return 1
 
     survived = 0
-    for desc, fixed, buggy in MUTANTS:
+    for desc, fixed, buggy, *tester in MUTANTS:
         if source.count(fixed) != 1:
             print(f"  STALE     {desc}: fixed code not found in libwyag.py, update this mutant")
             survived += 1
             continue
         start = time.time()
-        check = run(source.replace(fixed, buggy), args)
+        check = run(source.replace(fixed, buggy), args, *tester)
         print(f"  {'caught' if check else 'SURVIVED':9} {desc}  "
               f"[{check or '-'}, {time.time() - start:.0f}s]", flush=True)
         survived += not check

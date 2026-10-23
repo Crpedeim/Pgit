@@ -12,6 +12,7 @@ A working reimplementation of Git's internals in a single Python library (~1,600
 - [Interoperability (verified)](#interoperability-verified)
 - [Differential testing against real Git](#differential-testing-against-real-git)
 - [Crash safety](#crash-safety)
+- [Packfiles: reading real repositories](#packfiles-reading-real-repositories)
 - [How Git works — and what Pgit implements](#how-git-works--and-what-pgit-implements)
   - [1. Content-addressable object storage](#1-content-addressable-object-storage)
   - [2. The four object types](#2-the-four-object-types)
@@ -148,6 +149,35 @@ python3 tests/crashtest.py --mode kill --kills 1000
 
 ---
 
+## Packfiles: reading real repositories
+
+Loose objects (one zlib file per object) are only how *new* objects start out. `git clone`, `git gc` and `git push` store objects in **packfiles**, so before this, Pgit couldn't read almost any real repository. Most objects in a pack are stored as a **delta** against another object. Pgit now reads them all, in pure Python:
+
+- **Pack index (`.idx` v2):** a 256-entry fanout table narrows the search to objects sharing a first byte, then binary search over the sorted SHAs gives the object's offset in the pack (with the 8-byte table for packs over 2 GiB). The same structure answers abbreviated SHAs like `rev-parse 00bee`.
+- **Packfile objects:** a variable-length type/size header, then a zlib stream. Commits, trees, blobs and tags are stored whole.
+- **Deltas:** `OFS_DELTA` names its base by a backwards offset in the same pack, and `REF_DELTA` by SHA. A delta is a list of *copy a range of the base* and *insert these bytes* instructions. Chains can be hundreds deep, so they're walked with a loop, not recursion, and recently built objects are kept in a small LRU cache.
+- **`packed-refs`:** branches and tags packed into one file. A loose ref file still wins, so `pgit commit` on a packed branch writes a loose ref, just as Git does.
+
+`tests/packtest.py` builds repositories that hit each part of the format (deep `OFS_DELTA` chains via `gc --aggressive`, a `REF_DELTA` repack, a file over 64 KiB so deltas use the special 0x10000-byte copy, annotated tags) and can add any real clone. For every repository, **every object** Pgit reads must be byte-identical to `git cat-file`, including a random sample read cold in random order. Abbreviated SHAs, `show-ref`, `log`, `ls-tree`, a clean `status` and a commit on top that passes `git fsck` are checked too. The differential tester also runs `git gc` mid-sequence, so Pgit keeps working after Git packs everything.
+
+| Repository | Objects | Stored as deltas | Longest delta chain | Result |
+|---|---|---|---|---|
+| Built: `gc --aggressive` | 2,361 | 1,200 (`OFS_DELTA`) | 24 | all byte-identical |
+| Built: `REF_DELTA` repack | 2,361 | 1,188 (`REF_DELTA`) | 24 | all byte-identical |
+| [pallets/flask](https://github.com/pallets/flask) | 26,390 | 17,638 | 22 | all byte-identical, ~13,000 objects/s |
+| Flask repacked `--depth=250` | 26,390 | 18,814 | 173 | all byte-identical |
+| [git/git](https://github.com/git/git) | 422,278 | 320,022 | 50 | all byte-identical, ~3,700 objects/s |
+
+Eight more mutants break one rule of the pack format each (for example the `+1` in `OFS_DELTA` offsets, or the size-0 copy meaning 0x10000), and every one is caught.
+
+```bash
+python3 tests/packtest.py                     # built repositories, offline
+python3 tests/packtest.py --clone https://github.com/pallets/flask.git
+python3 tests/packtest.py --repo ~/src/git    # any existing clone
+```
+
+---
+
 ## How Git works — and what Pgit implements
 
 ### 1. Content-addressable object storage
@@ -258,4 +288,5 @@ git cat-file -p <that-sha>                      # real git reads it
 ### Limitations & possible extensions
 - **No `branch`/`merge`/`diff` yet.** Branches exist as refs and can be created by hand; a `branch` command and three-way `merge` are the natural next additions.
 - A `tag` implementation exists in the code but isn't yet wired into the CLI.
-- Packfiles and the network protocol are out of scope — this is the local object model, which is where Git's core ideas live.
+- **Packfiles are read but not written.** Pgit writes new objects as loose files (as Git does too until `gc`); writing packs with delta compression is a natural extension.
+- No network protocol yet (`clone`/`fetch`/`push`).

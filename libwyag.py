@@ -1,4 +1,6 @@
 import argparse
+import bisect
+import collections
 import configparser
 from datetime import datetime
 try:
@@ -8,6 +10,7 @@ except ModuleNotFoundError:
     exit
 import hashlib
 from math import ceil
+import mmap
 import os
 import re
 import sys
@@ -141,6 +144,7 @@ class GitRepository (object):
     worktree = None
     gitdir = None
     conf = None
+    packs = None # Opened lazily by repo_packs()
 
     def __init__(self , path, force = False):
         
@@ -293,13 +297,20 @@ What exactly that means depend on each subclass.
     def init(self):
         pass
 
-def object_read(repo , sha):
-    """Read an object from a GIT repo and return an object"""
+def object_read_raw(repo, sha):
+    """Return (type, content) of an object, loose or packed, or None."""
 
-    path = repo_file(repo,"objects",sha[0:2],sha[2:])
+    # repo_path, not repo_file: objects/xx/ often doesn't exist when
+    # everything is packed.
+    path = repo_path(repo,"objects",sha[0:2],sha[2:])
 
     if not os.path.isfile(path):
+        for pack in repo_packs(repo):
+            found = pack.read(sha)
+            if found:
+                return found
         return None
+
     with open(path,"rb") as f:
         raw = zlib.decompress(f.read())
 
@@ -310,18 +321,245 @@ def object_read(repo , sha):
         size = int(raw[x:y].decode('ascii'))
         if size != len(raw) - y - 1: # Checking if length is valid
             raise Exception(f"Malinformed object {sha}: bad length")
-        
-        
-        match fmt:
-            case b'commit' : c=GitCommit
-            case b'tree'   : c=GitTree
-            case b'tag'    : c=GitTag
-            case b'blob'   : c=GitBlob
-            case _:
-                raise Exception(f"Unknown type {fmt.decode('ascii')} for object {sha}")
-        
-        return c(raw[y+1 :]) #??
-    
+
+        return fmt, raw[y+1 :]
+
+
+def object_read(repo , sha):
+    """Read an object from a GIT repo and return an object"""
+
+    found = object_read_raw(repo, sha)
+    if found is None:
+        return None
+    fmt, data = found
+
+    match fmt:
+        case b'commit' : c=GitCommit
+        case b'tree'   : c=GitTree
+        case b'tag'    : c=GitTag
+        case b'blob'   : c=GitBlob
+        case _:
+            raise Exception(f"Unknown type {fmt.decode('ascii')} for object {sha}")
+
+    return c(data)
+
+
+## Packfiles
+
+class GitPackIndex(object):
+    """A pack index (.idx, version 2): the sorted SHAs of a packfile's
+    objects, with each one's offset in the pack."""
+
+    def __init__(self, path):
+        with open(path, "rb") as f:
+            data = f.read()
+        if data[:4] != b"\xfftOc" or int.from_bytes(data[4:8], "big") != 2:
+            raise Exception(f"Unsupported pack index (only version 2): {path}")
+
+        # Fanout: fanout[b] = number of objects whose first byte is <= b.
+        self.fanout = [int.from_bytes(data[8 + 4*i : 12 + 4*i], "big") for i in range(256)]
+        n = self.count = self.fanout[255]
+
+        names = 8 + 1024
+        offsets = names + 20*n + 4*n # Skip the CRC32 table
+        large = offsets + 4*n
+        self.names = [data[names + 20*i : names + 20*i + 20] for i in range(n)]
+        self.offsets = []
+        for i in range(n):
+            off = int.from_bytes(data[offsets + 4*i : offsets + 4*i + 4], "big")
+            if off & 0x80000000: # Packs over 2 GiB: index into the 8-byte table
+                j = off & 0x7fffffff
+                off = int.from_bytes(data[large + 8*j : large + 8*j + 8], "big")
+            self.offsets.append(off)
+
+    def _bucket(self, first_byte):
+        lo = self.fanout[first_byte - 1] if first_byte else 0
+        return lo, self.fanout[first_byte]
+
+    def find(self, sha):
+        """Offset of the object with this (binary) SHA, or None."""
+        lo, hi = self._bucket(sha[0])
+        i = bisect.bisect_left(self.names, sha, lo, hi)
+        if i < hi and self.names[i] == sha:
+            return self.offsets[i]
+        return None
+
+    def prefix(self, hexprefix):
+        """Hex SHAs of every object starting with hexprefix."""
+        lo, hi = self._bucket(int(hexprefix[:2], 16))
+        start = bytes.fromhex(hexprefix[:len(hexprefix) // 2 * 2])
+        i = bisect.bisect_left(self.names, start, lo, hi)
+        ret = []
+        # Scan every name sharing the whole bytes; an odd last hex digit
+        # filters within them.
+        while i < hi and self.names[i].startswith(start):
+            if self.names[i].hex().startswith(hexprefix):
+                ret.append(self.names[i].hex())
+            i += 1
+        return ret
+
+
+PACK_TYPES = {1: b"commit", 2: b"tree", 3: b"blob", 4: b"tag"}
+OFS_DELTA, REF_DELTA = 6, 7
+
+
+def delta_varint(data, pos):
+    """Little-endian base-128 integer, used for sizes in a delta."""
+    value = shift = 0
+    while True:
+        c = data[pos]
+        pos += 1
+        value |= (c & 0x7f) << shift
+        shift += 7
+        if not c & 0x80:
+            return value, pos
+
+
+def delta_apply(base, delta):
+    """Rebuild an object from its base and a delta: a list of copy
+    (a range of the base) and insert (literal bytes) instructions."""
+    src_size, pos = delta_varint(delta, 0)
+    dst_size, pos = delta_varint(delta, pos)
+    if src_size != len(base):
+        raise Exception("Delta base size mismatch")
+
+    out = bytearray()
+    while pos < len(delta):
+        cmd = delta[pos]
+        pos += 1
+        if cmd & 0x80: # Copy: bits 0-3 say which offset bytes follow, 4-6 which size bytes
+            offset = size = 0
+            for i in range(4):
+                if cmd & (1 << i):
+                    offset |= delta[pos] << (8 * i)
+                    pos += 1
+            for i in range(3):
+                if cmd & (1 << (4 + i)):
+                    size |= delta[pos] << (8 * i)
+                    pos += 1
+            out += base[offset : offset + (size or 0x10000)]
+        elif cmd: # Insert the next cmd bytes
+            out += delta[pos : pos + cmd]
+            pos += cmd
+        else:
+            raise Exception("Invalid delta instruction 0")
+
+    if len(out) != dst_size:
+        raise Exception("Delta result size mismatch")
+    return bytes(out)
+
+
+class GitPack(object):
+    """A packfile: many objects, each zlib-compressed, many of them stored
+    as a delta against another object."""
+
+    CACHE_SIZE = 256
+
+    def __init__(self, path, lookup):
+        self.index = GitPackIndex(path[:-5] + ".idx")
+        with open(path, "rb") as f:
+            self.data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        if self.data[:4] != b"PACK":
+            raise Exception(f"Not a packfile: {path}")
+        self.lookup = lookup # Resolves a REF_DELTA base outside this pack
+        self.cache = collections.OrderedDict() # offset -> (fmt, data)
+
+    def _header(self, pos):
+        c = self.data[pos]
+        pos += 1
+        kind = (c >> 4) & 7
+        size = c & 0x0f
+        shift = 4
+        while c & 0x80:
+            c = self.data[pos]
+            pos += 1
+            size |= (c & 0x7f) << shift
+            shift += 7
+        return kind, size, pos
+
+    def _inflate(self, pos, size):
+        d = zlib.decompressobj()
+        out = b""
+        chunk = max(size, 1024)
+        while not d.eof:
+            piece = self.data[pos : pos + chunk]
+            if not piece:
+                raise Exception("Truncated packfile")
+            out += d.decompress(piece)
+            pos += chunk
+        if len(out) != size:
+            raise Exception("Pack object size mismatch")
+        return out
+
+    def read_at(self, offset):
+        """(fmt, data) of the object at this offset, resolving deltas."""
+        # Walk the delta chain down to a full object, without recursion:
+        # chains in real repositories are often 50 deep or more.
+        deltas = []
+        while True:
+            if offset in self.cache:
+                self.cache.move_to_end(offset)
+                fmt, data = self.cache[offset]
+                break
+            kind, size, pos = self._header(offset)
+            if kind == OFS_DELTA:
+                c = self.data[pos]
+                pos += 1
+                rel = c & 0x7f
+                while c & 0x80:
+                    c = self.data[pos]
+                    pos += 1
+                    rel = ((rel + 1) << 7) | (c & 0x7f)
+                deltas.append((offset, self._inflate(pos, size)))
+                offset -= rel
+            elif kind == REF_DELTA:
+                base = self.data[pos : pos + 20]
+                deltas.append((offset, self._inflate(pos + 20, size)))
+                base_offset = self.index.find(base)
+                if base_offset is None: # Base lives elsewhere (thin pack)
+                    fmt, data = self.lookup(base.hex())
+                    break
+                offset = base_offset
+            elif kind in PACK_TYPES:
+                fmt, data = PACK_TYPES[kind], self._inflate(pos, size)
+                self._remember(offset, fmt, data)
+                break
+            else:
+                raise Exception(f"Unknown pack object type {kind}")
+
+        for (delta_offset, delta) in reversed(deltas):
+            data = delta_apply(data, delta)
+            self._remember(delta_offset, fmt, data)
+        return fmt, data
+
+    def _remember(self, offset, fmt, data):
+        self.cache[offset] = (fmt, data)
+        if len(self.cache) > self.CACHE_SIZE:
+            self.cache.popitem(last=False)
+
+    def read(self, sha):
+        offset = self.index.find(bytes.fromhex(sha))
+        return None if offset is None else self.read_at(offset)
+
+
+def repo_packs(repo):
+    """The repository's packfiles, opened once per GitRepository."""
+    if repo.packs is None:
+        repo.packs = []
+        pack_dir = repo_dir(repo, "objects", "pack")
+        if pack_dir:
+            for name in sorted(os.listdir(pack_dir)):
+                if name.endswith(".pack") and os.path.exists(os.path.join(pack_dir, name[:-5] + ".idx")):
+                    repo.packs.append(GitPack(os.path.join(pack_dir, name),
+                                              lambda sha: object_read_raw(repo, sha)))
+    return repo.packs
+
+
+def object_in_pack(repo, sha):
+    sha = bytes.fromhex(sha)
+    return any(pack.index.find(sha) is not None for pack in repo_packs(repo))
+
+
 def fsync_dir(path):
     """Make a rename in this directory durable."""
     if os.name == "nt":
@@ -404,7 +642,7 @@ def object_write(obj , repo):
 
             path = repo_file(repo,"objects",sha[0:2],sha[2:],mkdir=True)
 
-            if not os.path.exists(path):
+            if not os.path.exists(path) and not object_in_pack(repo, sha):
                 write_atomic(path, zlib.compress(result))
         return sha
 
@@ -465,6 +703,11 @@ This function is aware of:
                     # Notice a string startswith() itself, so this
                     # works for full hashes.
                     candidates.append(prefix + f)
+        # The same object may be both loose and packed.
+        for pack in repo_packs(repo):
+            for sha in pack.index.prefix(name):
+                if sha not in candidates:
+                    candidates.append(sha)
 
     # Try for references.
     as_tag = ref_resolve(repo, "refs/tags/" + name)
@@ -624,35 +867,33 @@ def cmd_log(args):
     print("}")
 
 def log_graphviz(repo, sha, seen):
+    # An explicit stack instead of recursion: real histories are tens of
+    # thousands of commits deep.
+    stack = [sha]
+    while stack:
+        sha = stack.pop()
+        if sha in seen:
+            continue
+        seen.add(sha)
 
-    if sha in seen:
-        return
-    seen.add(sha)
+        commit = object_read(repo, sha)
+        assert commit.fmt==b'commit'
+        message = commit.kvlm[None].decode("utf8", errors="replace").strip()
+        message = message.replace("\\", "\\\\")
+        message = message.replace("\"", "\\\"")
 
-    commit = object_read(repo, sha)
-    message = commit.kvlm[None].decode("utf8").strip()
-    message = message.replace("\\", "\\\\")
-    message = message.replace("\"", "\\\"")
+        if "\n" in message: # Keep only the first line
+            message = message[:message.index("\n")]
 
-    if "\n" in message: # Keep only the first line
-        message = message[:message.index("\n")]
+        print(f"  c_{sha} [label=\"{sha[0:7]}: {message}\"]")
 
-    print(f"  c_{sha} [label=\"{sha[0:7]}: {message}\"]")
-    assert commit.fmt==b'commit'
+        parents = commit.kvlm.get(b'parent', [])
+        if type(parents) != list:
+            parents = [ parents ]
 
-    if not b'parent' in commit.kvlm.keys():
-        # Base case: the initial commit.
-        return
-
-    parents = commit.kvlm[b'parent']
-
-    if type(parents) != list:
-        parents = [ parents ]
-
-    for p in parents:
-        p = p.decode("ascii")
-        print (f"  c_{sha} -> c_{p};")
-        log_graphviz(repo, p, seen)
+        for p in parents:
+            print (f"  c_{sha} -> c_{p.decode('ascii')};")
+        stack.extend(p.decode("ascii") for p in reversed(parents))
 
 class GitTreeLeaf(object):
 
@@ -794,13 +1035,31 @@ def tree_checkout(repo, tree, path): ##???
                 f.write(obj.blobdata)
 
 
+def packed_refs(repo):
+    """Refs that git pack-refs (or git gc, or clone) moved into
+    .git/packed-refs: "<sha> <refname>" lines."""
+    ret = dict()
+    path = repo_file(repo, "packed-refs")
+    if os.path.isfile(path):
+        with open(path, "r") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line or line[0] in "#^": # Header, or a peeled tag
+                    continue
+                sha, name = line.split(" ", 1)
+                ret[name] = sha
+    return ret
+
+
 def ref_resolve(repo,ref):
 
     path = repo_file(repo,ref)
 
 
     if not os.path.isfile(path):
-        return None
+        # A loose ref file wins; otherwise look in packed-refs.
+        name = os.path.relpath(path, repo.gitdir).replace(os.sep, "/")
+        return packed_refs(repo).get(name)
     
     with open(path,'r') as fp:
         data = fp.read()[:-1]
@@ -814,7 +1073,15 @@ def ref_resolve(repo,ref):
 def ref_list(repo, path=None):
 
     if not path:
-        path = repo_dir(repo,"refs")
+        ret = ref_list(repo, repo_dir(repo, "refs"))
+        # Add packed refs that have no loose file.
+        for name, sha in packed_refs(repo).items():
+            node = ret
+            parts = name.split("/")[1:] # Drop "refs"
+            for part in parts[:-1]:
+                node = node.setdefault(part, dict())
+            node.setdefault(parts[-1], sha)
+        return ref_sorted(ret)
 
     ret = dict()
 
@@ -827,6 +1094,11 @@ def ref_list(repo, path=None):
             ret[f] = ref_resolve(repo,can)
 
     return ret
+
+
+def ref_sorted(refs):
+    return {k: ref_sorted(v) if isinstance(v, dict) else v
+            for k, v in sorted(refs.items())}
 
 
 def cmd_show_ref(args):

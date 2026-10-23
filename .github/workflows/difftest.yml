@@ -41,3 +41,13 @@ jobs:
         with:
           python-version: "3.12"
       - run: python3 tests/crashtest.py --kills 100
+
+  packtest:
+    name: Reads packed repositories like Git
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 tests/packtest.py --clone https://github.com/pallets/flask.git

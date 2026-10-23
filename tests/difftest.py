@@ -4,7 +4,8 @@ Git side by side and checks that they never disagree.
 
 Operations include the edge cases that broke Pgit before: rewriting a file
 right after staging it (same size, same timestamp), and replacing a file
-with a directory.
+with a directory. A gc operation has real Git pack either repository
+(objects into a packfile, refs into packed-refs) mid-sequence.
 
 Each sequence builds two repositories from the same random operations, one
 with Pgit and one with real Git. After every operation the harness compares:
@@ -99,6 +100,9 @@ def gen_op(rng, n):
     if r < 0.82:
         return {"op": "file-to-dir", "pick": rng.randrange(1 << 16),
                 "name": rng.choice(NAMES)}
+    if r < 0.85:
+        return {"op": "gc", "target": rng.choice(["pgit", "git", "both"]),
+                "aggressive": rng.random() < 0.3}
     return {"op": "commit", "message": f"commit {n}"}
 
 
@@ -287,6 +291,15 @@ def apply_op(env, op, pg, rg):
             os.makedirs(os.path.join(root, path))
             with open(os.path.join(root, path, op["name"]), "wb") as f:
                 f.write(b"now a directory\n")
+        return True
+
+    if kind == "gc":
+        # Real Git packs every object into a packfile and every ref into
+        # packed-refs; Pgit must keep reading and updating the repository.
+        targets = {"pgit": [pg], "git": [rg], "both": [pg, rg]}[op["target"]]
+        for repo in targets:
+            git(env, repo, "gc", "-q", "--prune=now",
+                *(["--aggressive"] if op["aggressive"] else []))
         return True
 
     if kind == "commit":
