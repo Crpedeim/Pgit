@@ -8,10 +8,18 @@ A working reimplementation of Git's internals in a single Python library (~2,000
 
 ## Demo
 
-| What Pgit does | How it's tested |
+| Video 1: What Pgit does | Video 2: How it's tested |
 |---|---|
-| [![Pgit demo: basics and reading a real cloned repository](https://img.youtube.com/vi/hkuoLsDaoPs/hqdefault.jpg)](https://youtu.be/hkuoLsDaoPs) | [![Pgit demo: crash safety and the test harnesses](https://img.youtube.com/vi/ON8LzCZxVcc/hqdefault.jpg)](https://youtu.be/ON8LzCZxVcc) |
-| Pgit creates a repository that real Git accepts (same SHAs, `git fsck` passes), then reads a repository cloned from GitHub: every object packed, history, trees and refs identical to Git's. | Before vs after crash safety under `kill -9` and concurrent writers, then the differential tester against real Git and the pack tester on a real clone. |
+| [![Video 1: What Pgit does](https://img.youtube.com/vi/hkuoLsDaoPs/hqdefault.jpg)](https://youtu.be/hkuoLsDaoPs) | [![Video 2: How it's tested](https://img.youtube.com/vi/ON8LzCZxVcc/hqdefault.jpg)](https://youtu.be/ON8LzCZxVcc) |
+
+**[Video 1: What Pgit does](https://youtu.be/hkuoLsDaoPs)**. Pgit used on its own, with real Git checking its work.
+1. **Building a repository with Pgit:** `init`, `add`, `status` and `commit`. `pgit hash-object` and `git hash-object` print the same SHA, real `git log` shows Pgit's commits, and `git fsck --strict` passes. `check-ignore` applies `.gitignore` rules, including negation (`!keep.log`) and directory patterns (`build/`).
+2. **Reading a real repository cloned from GitHub** ([pallets/flask](https://github.com/pallets/flask)), where every object is in a packfile and the refs are in `packed-refs`. Pgit walks the full history (same commit count as `git rev-list`), and its `ls-tree` and `show-ref` output is identical to Git's. It resolves an abbreviated SHA, shows a clean `status`, and makes a commit on top that real Git accepts.
+
+**[Video 2: How it's tested](https://youtu.be/ON8LzCZxVcc)**. The test harnesses that prove the claims above.
+1. **Crash safety, before vs after:** the [crash tester](#crash-safety) kills Pgit with `kill -9` mid-command 100 times and runs 8 `pgit add`s at once, first on the code from before crash safety (corrupted repositories and lost updates), then on the current code (none).
+2. **Differential testing:** the [differential tester](#differential-testing-against-real-git) runs random sequences of operations through Pgit and real Git side by side and finds 0 divergences.
+3. **Pack testing:** the [pack tester](#packfiles-reading-real-repositories) checks every object of built repositories and a real Flask clone byte-for-byte against `git cat-file`.
 
 ---
 
