@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
 
+import signal
 import libwyag
+
+# Exit quietly when output is piped into a command that stops reading
+# early, like head, instead of raising BrokenPipeError.
+if hasattr(signal, "SIGPIPE"):
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
 libwyag.main()
