@@ -104,8 +104,10 @@ def gen_op(rng, n):
         return {"op": "gc", "target": rng.choice(["pgit", "git", "both"]),
                 "aggressive": rng.random() < 0.3}
     if r < 0.88:
-        return {"op": "symlink", "path": rand_path(rng),
-                "target": rng.choice(["f.txt", "a", "a/b/f", "../f.txt", "missing"])}
+        target = rng.choice(["f.txt", "a", "a/b/f", "../f.txt", "missing"])
+        if rng.random() < 0.5: # Replace an existing file with the link
+            return {"op": "symlink", "pick": rng.randrange(1 << 16), "target": target}
+        return {"op": "symlink", "path": rand_path(rng), "target": target}
     return {"op": "commit", "message": f"commit {n}"}
 
 
@@ -304,11 +306,19 @@ def apply_op(env, op, pg, rg):
 
     if kind == "symlink":
         # Targets stay inside the repository; some dangle.
-        if not (can_write(rg, op["path"]) and can_write(pg, op["path"])) \
-           or os.path.lexists(os.path.join(rg, op["path"])):
-            return False
+        if "pick" in op: # Replace a regular file: a type change
+            path = pick(op, regular_files(rg))
+            if not path:
+                return False
+            for root in (pg, rg):
+                os.unlink(os.path.join(root, path))
+        else:
+            path = op["path"]
+            if not (can_write(rg, path) and can_write(pg, path)) \
+               or os.path.lexists(os.path.join(rg, path)):
+                return False
         for root in (pg, rg):
-            full = os.path.join(root, op["path"])
+            full = os.path.join(root, path)
             os.makedirs(os.path.dirname(full), exist_ok=True)
             os.symlink(op["target"], full)
         return True
@@ -464,8 +474,12 @@ def compare(env, pg, rg, committed=False):
     if not committed:
         return
 
+    # Warnings about content (e.g. a committed symlinked .gitignore) appear
+    # in Git's identical repository too; anything beyond those is Pgit's.
     fsck = git(env, pg, "fsck", "--strict", "--no-dangling", check=False)
-    if fsck.returncode != 0 or fsck.stderr.strip():
+    reference = git(env, rg, "fsck", "--strict", "--no-dangling", check=False)
+    extra = set(fsck.stderr.splitlines()) - set(reference.stderr.splitlines())
+    if fsck.returncode != 0 or extra:
         raise Divergence("fsck", fsck.stderr.decode(errors="replace").strip())
 
     # Pgit reading Git's repository.

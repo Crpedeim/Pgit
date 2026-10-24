@@ -1573,8 +1573,10 @@ def gitignore_read(repo):
             dir_name = os.path.relpath(root, repo.worktree)
             if dir_name == ".":
                 dir_name = ""
-            with open(os.path.join(root, ".gitignore"), "r", encoding="utf8", errors="replace") as f:
-                ret.scoped[dir_name] = gitignore_parse(f.readlines())
+            # Like Git (2.32+), don't follow a .gitignore that is a symlink.
+            if not os.path.islink(os.path.join(root, ".gitignore")):
+                with open(os.path.join(root, ".gitignore"), "r", encoding="utf8", errors="replace") as f:
+                    ret.scoped[dir_name] = gitignore_parse(f.readlines())
     return ret
 
 
@@ -1742,6 +1744,8 @@ def cmd_status_index_worktree(repo, index):
                 print("  deleted: ", entry.name) # Gone, or replaced by a directory
             elif not os.path.islink(full_path) or symlink_sha(full_path) != entry.sha:
                 print("  modified:", entry.name)
+        elif os.path.islink(full_path): # A file replaced by a symlink: a type change
+            print("  modified:", entry.name)
         elif not os.path.isfile(full_path): # Gone, or replaced by a directory
             print("  deleted: ", entry.name)
         else:

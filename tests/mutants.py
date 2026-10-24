@@ -126,6 +126,14 @@ MUTANTS = [
      '''        if entry.mode_type == 0b1110:
             if not os.path.isfile(full_path):''', "packtest"),
 
+    ("status follows a symlink that replaced a tracked file",
+     '''        elif os.path.islink(full_path): # A file replaced by a symlink: a type change''',
+     '''        elif False:'''),
+
+    ("a symlinked .gitignore is followed (Git ignores it)",
+     '''            if not os.path.islink(os.path.join(root, ".gitignore")):''',
+     '''            if True:'''),
+
     ("rm crashes on a file already deleted from disk",
      '''            if os.path.lexists(path): # It may already be gone from the worktree
                 os.unlink(path)''',
