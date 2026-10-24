@@ -266,7 +266,7 @@ All 14 commands are wired into the CLI and tested against real Git.
 ## Usage
 
 ```bash
-# no third-party dependencies — standard library only
+# Python 3.10+, no third-party dependencies — standard library only
 python3 wyag init .
 python3 wyag add file.txt
 python3 wyag commit -m "your message"

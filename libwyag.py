@@ -732,7 +732,8 @@ def object_find(repo, name, fmt=None, follow=True):
         raise Exception(f"No such reference {name}.")
 
     if len(sha) > 1:
-        raise Exception(f"Ambiguous reference {name}: Candidates are:\n - {'\n - '.join(sha)}.")
+        candidates = "\n - ".join(sha)
+        raise Exception(f"Ambiguous reference {name}: Candidates are:\n - {candidates}.")
 
     sha = sha[0]
 

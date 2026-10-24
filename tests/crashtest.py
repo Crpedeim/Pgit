@@ -370,7 +370,7 @@ def run_concurrent(base, rounds, width):
     is an error."""
     repo = os.path.join(base, "concurrent")
     setup_base(repo)
-    lost = refused = landed = errors = 0
+    lost = refused = landed = errors = unreadable = 0
     for n in range(rounds):
         names = [f"c/{n}-{i}.txt" for i in range(width)]
         for name in names:
@@ -379,7 +379,13 @@ def run_concurrent(base, rounds, width):
                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
                  for name in names]
         results = [(p.wait(), p.stderr.read()) for p in procs]
-        staged = set(git(repo, "ls-files").stdout.split())
+        ls = git(repo, "ls-files", check=False)
+        if ls.returncode != 0: # The index itself was corrupted
+            unreadable += 1
+            shutil.rmtree(repo)
+            setup_base(repo)
+            continue
+        staged = set(ls.stdout.split())
         for name, (rc, err) in zip(names, results):
             if rc == 0:
                 if name in staged:
@@ -390,7 +396,7 @@ def run_concurrent(base, rounds, width):
                 refused += 1
             else:
                 errors += 1
-    return landed, refused, lost, errors
+    return landed, refused, lost, errors, unreadable
 
 
 def main():
@@ -424,10 +430,11 @@ def main():
             broken += failures
         if args.mode in ("concurrent", "all"):
             print("Concurrent pgit add (8 processes x 25 rounds):")
-            landed, refused, lost, errors = run_concurrent(base, 25, 8)
+            landed, refused, lost, errors, unreadable = run_concurrent(base, 25, 8)
             print(f"  {landed} staged, {refused} refused by index.lock, "
-                  f"{lost} lost updates, {errors} other errors")
-            broken += lost + errors
+                  f"{lost} lost updates, {errors} other errors, "
+                  f"{unreadable} rounds left the index unreadable")
+            broken += lost + errors + unreadable
     finally:
         shutil.rmtree(base, ignore_errors=True)
     return 1 if broken else 0
