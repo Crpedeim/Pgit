@@ -88,8 +88,9 @@ def gen_op(rng, n):
     if r < 0.43:
         return {"op": "delete", "pick": rng.randrange(1 << 16)}
     if r < 0.48:
+        # stage: also git add / pgit add it, giving a staged mode change.
         return {"op": "chmod", "pick": rng.randrange(1 << 16),
-                "exec": rng.random() < 0.5}
+                "exec": rng.random() < 0.5, "stage": rng.random() < 0.5}
     if r < 0.70:
         return {"op": "add", "paths": "*" if rng.random() < 0.3
                 else [rand_path(rng) for _ in range(rng.randint(1, 3))]}
@@ -239,6 +240,9 @@ def apply_op(env, op, pg, rg):
         for root in (pg, rg):
             os.chmod(os.path.join(root, path),
                      0o755 if op["exec"] else 0o644)
+        if op.get("stage"):
+            git(env, rg, "add", "-f", "--", path)
+            pgit(pg, "add", path)
         return True
 
     if kind == "add":
