@@ -1,4 +1,6 @@
 import argparse
+import bisect
+import collections
 import configparser
 from datetime import datetime
 try:
@@ -6,12 +8,13 @@ try:
 except ModuleNotFoundError:
     print("module notm found")
     exit
-from fnmatch import fnmatch
 import hashlib
 from math import ceil
+import mmap
 import os
 import re
 import sys
+import tempfile
 import zlib
 
 argparser = argparse.ArgumentParser(description="the git parser")
@@ -141,6 +144,7 @@ class GitRepository (object):
     worktree = None
     gitdir = None
     conf = None
+    packs = None # Opened lazily by repo_packs()
 
     def __init__(self , path, force = False):
         
@@ -239,7 +243,8 @@ def repo_default_config():
     ret.add_section("core")
    
     ret.set("core", "repositoryformatversion", "0")
-    ret.set("core", "filemode", "false")
+    # Like git init: track the executable bit, except on Windows.
+    ret.set("core", "filemode", "false" if os.name == "nt" else "true")
     ret.set("core", "bare", "false")
 
     return ret
@@ -292,13 +297,20 @@ What exactly that means depend on each subclass.
     def init(self):
         pass
 
-def object_read(repo , sha):
-    """Read an object from a GIT repo and return an object"""
+def object_read_raw(repo, sha):
+    """Return (type, content) of an object, loose or packed, or None."""
 
-    path = repo_file(repo,"objects",sha[0:2],sha[2:])
+    # repo_path, not repo_file: objects/xx/ often doesn't exist when
+    # everything is packed.
+    path = repo_path(repo,"objects",sha[0:2],sha[2:])
 
     if not os.path.isfile(path):
+        for pack in repo_packs(repo):
+            found = pack.read(sha)
+            if found:
+                return found
         return None
+
     with open(path,"rb") as f:
         raw = zlib.decompress(f.read())
 
@@ -309,18 +321,315 @@ def object_read(repo , sha):
         size = int(raw[x:y].decode('ascii'))
         if size != len(raw) - y - 1: # Checking if length is valid
             raise Exception(f"Malinformed object {sha}: bad length")
-        
-        
-        match fmt:
-            case b'commit' : c=GitCommit
-            case b'tree'   : c=GitTree
-            case b'tag'    : c=GitTag
-            case b'blob'   : c=GitBlob
-            case _:
-                raise Exception(f"Unknown type {fmt.decode('ascii')} for object {sha}")
-        
-        return c(raw[y+1 :]) #??
-    
+
+        return fmt, raw[y+1 :]
+
+
+def object_read(repo , sha):
+    """Read an object from a GIT repo and return an object"""
+
+    found = object_read_raw(repo, sha)
+    if found is None:
+        return None
+    fmt, data = found
+
+    match fmt:
+        case b'commit' : c=GitCommit
+        case b'tree'   : c=GitTree
+        case b'tag'    : c=GitTag
+        case b'blob'   : c=GitBlob
+        case _:
+            raise Exception(f"Unknown type {fmt.decode('ascii')} for object {sha}")
+
+    return c(data)
+
+
+## Packfiles
+
+class GitPackIndex(object):
+    """A pack index (.idx, version 2): the sorted SHAs of a packfile's
+    objects, with each one's offset in the pack."""
+
+    def __init__(self, path):
+        with open(path, "rb") as f:
+            data = f.read()
+        if data[:4] != b"\xfftOc" or int.from_bytes(data[4:8], "big") != 2:
+            raise Exception(f"Unsupported pack index (only version 2): {path}")
+
+        # Fanout: fanout[b] = number of objects whose first byte is <= b.
+        self.fanout = [int.from_bytes(data[8 + 4*i : 12 + 4*i], "big") for i in range(256)]
+        n = self.count = self.fanout[255]
+
+        names = 8 + 1024
+        offsets = names + 20*n + 4*n # Skip the CRC32 table
+        large = offsets + 4*n
+        self.names = [data[names + 20*i : names + 20*i + 20] for i in range(n)]
+        self.offsets = []
+        for i in range(n):
+            off = int.from_bytes(data[offsets + 4*i : offsets + 4*i + 4], "big")
+            if off & 0x80000000: # Packs over 2 GiB: index into the 8-byte table
+                j = off & 0x7fffffff
+                off = int.from_bytes(data[large + 8*j : large + 8*j + 8], "big")
+            self.offsets.append(off)
+
+    def _bucket(self, first_byte):
+        lo = self.fanout[first_byte - 1] if first_byte else 0
+        return lo, self.fanout[first_byte]
+
+    def find(self, sha):
+        """Offset of the object with this (binary) SHA, or None."""
+        lo, hi = self._bucket(sha[0])
+        i = bisect.bisect_left(self.names, sha, lo, hi)
+        if i < hi and self.names[i] == sha:
+            return self.offsets[i]
+        return None
+
+    def prefix(self, hexprefix):
+        """Hex SHAs of every object starting with hexprefix."""
+        lo, hi = self._bucket(int(hexprefix[:2], 16))
+        start = bytes.fromhex(hexprefix[:len(hexprefix) // 2 * 2])
+        i = bisect.bisect_left(self.names, start, lo, hi)
+        ret = []
+        # Scan every name sharing the whole bytes; an odd last hex digit
+        # filters within them.
+        while i < hi and self.names[i].startswith(start):
+            if self.names[i].hex().startswith(hexprefix):
+                ret.append(self.names[i].hex())
+            i += 1
+        return ret
+
+
+PACK_TYPES = {1: b"commit", 2: b"tree", 3: b"blob", 4: b"tag"}
+OFS_DELTA, REF_DELTA = 6, 7
+
+
+def delta_varint(data, pos):
+    """Little-endian base-128 integer, used for sizes in a delta."""
+    value = shift = 0
+    while True:
+        c = data[pos]
+        pos += 1
+        value |= (c & 0x7f) << shift
+        shift += 7
+        if not c & 0x80:
+            return value, pos
+
+
+def delta_apply(base, delta):
+    """Rebuild an object from its base and a delta: a list of copy
+    (a range of the base) and insert (literal bytes) instructions."""
+    src_size, pos = delta_varint(delta, 0)
+    dst_size, pos = delta_varint(delta, pos)
+    if src_size != len(base):
+        raise Exception("Delta base size mismatch")
+
+    out = bytearray()
+    while pos < len(delta):
+        cmd = delta[pos]
+        pos += 1
+        if cmd & 0x80: # Copy: bits 0-3 say which offset bytes follow, 4-6 which size bytes
+            offset = size = 0
+            for i in range(4):
+                if cmd & (1 << i):
+                    offset |= delta[pos] << (8 * i)
+                    pos += 1
+            for i in range(3):
+                if cmd & (1 << (4 + i)):
+                    size |= delta[pos] << (8 * i)
+                    pos += 1
+            out += base[offset : offset + (size or 0x10000)]
+        elif cmd: # Insert the next cmd bytes
+            out += delta[pos : pos + cmd]
+            pos += cmd
+        else:
+            raise Exception("Invalid delta instruction 0")
+
+    if len(out) != dst_size:
+        raise Exception("Delta result size mismatch")
+    return bytes(out)
+
+
+class GitPack(object):
+    """A packfile: many objects, each zlib-compressed, many of them stored
+    as a delta against another object."""
+
+    CACHE_SIZE = 256
+
+    def __init__(self, path, lookup):
+        self.index = GitPackIndex(path[:-5] + ".idx")
+        with open(path, "rb") as f:
+            self.data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        if self.data[:4] != b"PACK":
+            raise Exception(f"Not a packfile: {path}")
+        self.lookup = lookup # Resolves a REF_DELTA base outside this pack
+        self.cache = collections.OrderedDict() # offset -> (fmt, data)
+
+    def _header(self, pos):
+        c = self.data[pos]
+        pos += 1
+        kind = (c >> 4) & 7
+        size = c & 0x0f
+        shift = 4
+        while c & 0x80:
+            c = self.data[pos]
+            pos += 1
+            size |= (c & 0x7f) << shift
+            shift += 7
+        return kind, size, pos
+
+    def _inflate(self, pos, size):
+        d = zlib.decompressobj()
+        out = b""
+        chunk = max(size, 1024)
+        while not d.eof:
+            piece = self.data[pos : pos + chunk]
+            if not piece:
+                raise Exception("Truncated packfile")
+            out += d.decompress(piece)
+            pos += chunk
+        if len(out) != size:
+            raise Exception("Pack object size mismatch")
+        return out
+
+    def read_at(self, offset):
+        """(fmt, data) of the object at this offset, resolving deltas."""
+        # Walk the delta chain down to a full object, without recursion:
+        # chains in real repositories are often 50 deep or more.
+        deltas = []
+        while True:
+            if offset in self.cache:
+                self.cache.move_to_end(offset)
+                fmt, data = self.cache[offset]
+                break
+            kind, size, pos = self._header(offset)
+            if kind == OFS_DELTA:
+                c = self.data[pos]
+                pos += 1
+                rel = c & 0x7f
+                while c & 0x80:
+                    c = self.data[pos]
+                    pos += 1
+                    rel = ((rel + 1) << 7) | (c & 0x7f)
+                deltas.append((offset, self._inflate(pos, size)))
+                offset -= rel
+            elif kind == REF_DELTA:
+                base = self.data[pos : pos + 20]
+                deltas.append((offset, self._inflate(pos + 20, size)))
+                base_offset = self.index.find(base)
+                if base_offset is None: # Base lives elsewhere (thin pack)
+                    fmt, data = self.lookup(base.hex())
+                    break
+                offset = base_offset
+            elif kind in PACK_TYPES:
+                fmt, data = PACK_TYPES[kind], self._inflate(pos, size)
+                self._remember(offset, fmt, data)
+                break
+            else:
+                raise Exception(f"Unknown pack object type {kind}")
+
+        for (delta_offset, delta) in reversed(deltas):
+            data = delta_apply(data, delta)
+            self._remember(delta_offset, fmt, data)
+        return fmt, data
+
+    def _remember(self, offset, fmt, data):
+        self.cache[offset] = (fmt, data)
+        if len(self.cache) > self.CACHE_SIZE:
+            self.cache.popitem(last=False)
+
+    def read(self, sha):
+        offset = self.index.find(bytes.fromhex(sha))
+        return None if offset is None else self.read_at(offset)
+
+
+def repo_packs(repo):
+    """The repository's packfiles, opened once per GitRepository."""
+    if repo.packs is None:
+        repo.packs = []
+        pack_dir = repo_dir(repo, "objects", "pack")
+        if pack_dir:
+            for name in sorted(os.listdir(pack_dir)):
+                if name.endswith(".pack") and os.path.exists(os.path.join(pack_dir, name[:-5] + ".idx")):
+                    repo.packs.append(GitPack(os.path.join(pack_dir, name),
+                                              lambda sha: object_read_raw(repo, sha)))
+    return repo.packs
+
+
+def object_in_pack(repo, sha):
+    sha = bytes.fromhex(sha)
+    return any(pack.index.find(sha) is not None for pack in repo_packs(repo))
+
+
+def fsync_dir(path):
+    """Make a rename in this directory durable."""
+    if os.name == "nt":
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_atomic(path, data):
+    """Write data to path so that a crash leaves either nothing or the
+    whole file: write a temp file, fsync it, then rename it into place."""
+    dirname = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(prefix="tmp_obj_", dir=dirname)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o444) # Objects are immutable, like in Git
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    fsync_dir(dirname)
+
+
+class LockFile(object):
+    """Git's lockfile protocol: create PATH.lock exclusively, write the new
+    content into it, then rename it over PATH.  Only one process can hold
+    the lock, and readers see either the old file or the new one."""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = path + ".lock"
+        self.file = None
+
+    def __enter__(self):
+        try:
+            fd = os.open(self.lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            raise Exception(f"Unable to create '{self.lock}': File exists.\n\n"
+                            "Another pgit process seems to be running in this repository,\n"
+                            "or a previous one crashed. If no other process is running,\n"
+                            "remove the file manually to continue.")
+        self.file = os.fdopen(fd, "wb")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.file.flush()
+            os.fsync(self.file.fileno())
+            self.file.close()
+            os.replace(self.lock, self.path)
+            fsync_dir(os.path.dirname(self.path))
+        else:
+            self.file.close()
+            os.unlink(self.lock)
+        return False
+
+
+def ref_write(repo, path, sha):
+    """Point a ref (a path inside .git) at sha, atomically."""
+    with LockFile(repo_file(repo, path, mkdir=True)) as lock:
+        lock.file.write((sha + "\n").encode("ascii"))
+
+
 def object_write(obj , repo):
 
         data = obj.serialise()
@@ -333,10 +642,8 @@ def object_write(obj , repo):
 
             path = repo_file(repo,"objects",sha[0:2],sha[2:],mkdir=True)
 
-            if not os.path.exists(path): #??
-                with open(path, 'wb') as f:
-
-                    f.write(zlib.compress(result))
+            if not os.path.exists(path) and not object_in_pack(repo, sha):
+                write_atomic(path, zlib.compress(result))
         return sha
 
 
@@ -396,6 +703,11 @@ This function is aware of:
                     # Notice a string startswith() itself, so this
                     # works for full hashes.
                     candidates.append(prefix + f)
+        # The same object may be both loose and packed.
+        for pack in repo_packs(repo):
+            for sha in pack.index.prefix(name):
+                if sha not in candidates:
+                    candidates.append(sha)
 
     # Try for references.
     as_tag = ref_resolve(repo, "refs/tags/" + name)
@@ -420,11 +732,12 @@ def object_find(repo, name, fmt=None, follow=True):
         raise Exception(f"No such reference {name}.")
 
     if len(sha) > 1:
-        raise Exception(f"Ambiguous reference {name}: Candidates are:\n - {'\n - '.join(sha)}.")
+        candidates = "\n - ".join(sha)
+        raise Exception(f"Ambiguous reference {name}: Candidates are:\n - {candidates}.")
 
     sha = sha[0]
 
-    if not fmt:
+    if not fmt or sha is None: # None: HEAD on a branch with no commits yet
         return sha
 
     while True:
@@ -555,35 +868,33 @@ def cmd_log(args):
     print("}")
 
 def log_graphviz(repo, sha, seen):
+    # An explicit stack instead of recursion: real histories are tens of
+    # thousands of commits deep.
+    stack = [sha]
+    while stack:
+        sha = stack.pop()
+        if sha in seen:
+            continue
+        seen.add(sha)
 
-    if sha in seen:
-        return
-    seen.add(sha)
+        commit = object_read(repo, sha)
+        assert commit.fmt==b'commit'
+        message = commit.kvlm[None].decode("utf8", errors="replace").strip()
+        message = message.replace("\\", "\\\\")
+        message = message.replace("\"", "\\\"")
 
-    commit = object_read(repo, sha)
-    message = commit.kvlm[None].decode("utf8").strip()
-    message = message.replace("\\", "\\\\")
-    message = message.replace("\"", "\\\"")
+        if "\n" in message: # Keep only the first line
+            message = message[:message.index("\n")]
 
-    if "\n" in message: # Keep only the first line
-        message = message[:message.index("\n")]
+        print(f"  c_{sha} [label=\"{sha[0:7]}: {message}\"]")
 
-    print(f"  c_{sha} [label=\"{sha[0:7]}: {message}\"]")
-    assert commit.fmt==b'commit'
+        parents = commit.kvlm.get(b'parent', [])
+        if type(parents) != list:
+            parents = [ parents ]
 
-    if not b'parent' in commit.kvlm.keys():
-        # Base case: the initial commit.
-        return
-
-    parents = commit.kvlm[b'parent']
-
-    if type(parents) != list:
-        parents = [ parents ]
-
-    for p in parents:
-        p = p.decode("ascii")
-        print (f"  c_{sha} -> c_{p};")
-        log_graphviz(repo, p, seen)
+        for p in parents:
+            print (f"  c_{sha} -> c_{p.decode('ascii')};")
+        stack.extend(p.decode("ascii") for p in reversed(parents))
 
 class GitTreeLeaf(object):
 
@@ -624,7 +935,7 @@ def tree_parse(raw):
 
 
 def tree_leaf_sort_key(leaf):
-    if leaf.mode.startswith(b"4"):
+    if leaf.mode.lstrip(b"0").startswith(b"4"):
         return leaf.path + "/"
     else:
         return leaf.path
@@ -633,7 +944,8 @@ def tree_serialize(obj):
     obj.items.sort(key=tree_leaf_sort_key)
     ret = b''
     for i in obj.items:
-        ret += i.mode
+        # Git writes "40000", not "040000", for subtrees
+        ret += i.mode.lstrip(b"0")
         ret += b' '
         ret += i.path.encode("utf8")
         ret += b'\x00'
@@ -724,13 +1036,31 @@ def tree_checkout(repo, tree, path): ##???
                 f.write(obj.blobdata)
 
 
+def packed_refs(repo):
+    """Refs that git pack-refs (or git gc, or clone) moved into
+    .git/packed-refs: "<sha> <refname>" lines."""
+    ret = dict()
+    path = repo_file(repo, "packed-refs")
+    if os.path.isfile(path):
+        with open(path, "r") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line or line[0] in "#^": # Header, or a peeled tag
+                    continue
+                sha, name = line.split(" ", 1)
+                ret[name] = sha
+    return ret
+
+
 def ref_resolve(repo,ref):
 
     path = repo_file(repo,ref)
 
 
     if not os.path.isfile(path):
-        return None
+        # A loose ref file wins; otherwise look in packed-refs.
+        name = os.path.relpath(path, repo.gitdir).replace(os.sep, "/")
+        return packed_refs(repo).get(name)
     
     with open(path,'r') as fp:
         data = fp.read()[:-1]
@@ -744,7 +1074,15 @@ def ref_resolve(repo,ref):
 def ref_list(repo, path=None):
 
     if not path:
-        path = repo_dir(repo,"refs")
+        ret = ref_list(repo, repo_dir(repo, "refs"))
+        # Add packed refs that have no loose file.
+        for name, sha in packed_refs(repo).items():
+            node = ret
+            parts = name.split("/")[1:] # Drop "refs"
+            for part in parts[:-1]:
+                node = node.setdefault(part, dict())
+            node.setdefault(parts[-1], sha)
+        return ref_sorted(ret)
 
     ret = dict()
 
@@ -757,6 +1095,11 @@ def ref_list(repo, path=None):
             ret[f] = ref_resolve(repo,can)
 
     return ret
+
+
+def ref_sorted(refs):
+    return {k: ref_sorted(v) if isinstance(v, dict) else v
+            for k, v in sorted(refs.items())}
 
 
 def cmd_show_ref(args):
@@ -815,8 +1158,7 @@ def tag_create(repo, name, ref, create_tag_object=False):
         ref_create(repo, "tags/" + name, sha)
 
 def ref_create(repo, ref_name, sha):
-    with open(repo_file(repo, "refs/" + ref_name), 'w') as fp:
-        fp.write(sha + "\n")
+    ref_write(repo, "refs/" + ref_name, sha)
 
 
 def cmd_rev_parse(args):
@@ -878,64 +1220,94 @@ class GitIndex (object):
         self.entries = entries
 
 
-def index_write(repo, index):
-    with open(repo_file(repo, "index"), "wb") as f:
+class _Sha1Writer:
+    """Wraps a file, hashing everything written so the SHA-1 trailer can be appended."""
+    def __init__(self, f):
+        self.f = f
+        self.h = hashlib.sha1()
 
-        # HEADER
+    def write(self, data):
+        self.h.update(data)
+        self.f.write(data)
 
-        # Write the magic bytes.
-        f.write(b"DIRC")
-        # Write version number.
-        f.write(index.version.to_bytes(4, "big"))
-        # Write the number of entries.
-        f.write(len(index.entries).to_bytes(4, "big"))
 
-        # ENTRIES
+def index_write(repo, index, lock=None):
+    """Write the index.  Pass the LockFile when the caller already holds
+    it (to make a read-modify-write atomic); otherwise one is taken here."""
+    if lock is None:
+        with LockFile(repo_file(repo, "index")) as lock:
+            return index_write(repo, index, lock)
 
-        idx = 0
-        for e in index.entries:
-            f.write(e.ctime[0].to_bytes(4, "big"))
-            f.write(e.ctime[1].to_bytes(4, "big"))
-            f.write(e.mtime[0].to_bytes(4, "big"))
-            f.write(e.mtime[1].to_bytes(4, "big"))
-            f.write(e.dev.to_bytes(4, "big"))
-            f.write(e.ino.to_bytes(4, "big"))
+    raw = lock.file
+    f = _Sha1Writer(raw)
 
-            # Mode
-            mode = (e.mode_type << 12) | e.mode_perms
-            f.write(mode.to_bytes(4, "big"))
+    # Racy git: a file changed in the same second as this index write
+    # would look unchanged to Git's stat check, which by default compares
+    # whole seconds.  Like Git, write such entries with size 0 so they
+    # get re-hashed.
+    index_mtime_s = os.fstat(raw.fileno()).st_mtime_ns // 10**9
 
-            f.write(e.uid.to_bytes(4, "big"))
-            f.write(e.gid.to_bytes(4, "big"))
+    # Git requires entries sorted by path bytes.
+    index.entries.sort(key=lambda e: e.name.encode("utf8"))
 
-            f.write(e.fsize.to_bytes(4, "big"))
-            # @FIXME Convert back to int.
-            f.write(int(e.sha, 16).to_bytes(20, "big"))
+    # HEADER
 
-            flag_assume_valid = 0x1 << 15 if e.flag_assume_valid else 0
+    # Write the magic bytes.
+    f.write(b"DIRC")
+    # Write version number.
+    f.write(index.version.to_bytes(4, "big"))
+    # Write the number of entries.
+    f.write(len(index.entries).to_bytes(4, "big"))
 
-            name_bytes = e.name.encode("utf8")
-            bytes_len = len(name_bytes)
-            if bytes_len >= 0xFFF:
-                name_length = 0xFFF
-            else:
-                name_length = bytes_len
+    # ENTRIES
 
-            # We merge back three pieces of data (two flags and the
-            # length of the name) on the same two bytes.
-            f.write((flag_assume_valid | e.flag_stage | name_length).to_bytes(2, "big"))
+    idx = 0
+    for e in index.entries:
+        f.write(e.ctime[0].to_bytes(4, "big"))
+        f.write(e.ctime[1].to_bytes(4, "big"))
+        f.write(e.mtime[0].to_bytes(4, "big"))
+        f.write(e.mtime[1].to_bytes(4, "big"))
+        f.write(e.dev.to_bytes(4, "big"))
+        f.write(e.ino.to_bytes(4, "big"))
 
-            # Write back the name, and a final 0x00.
-            f.write(name_bytes)
-            f.write((0).to_bytes(1, "big"))
+        # Mode
+        mode = (e.mode_type << 12) | e.mode_perms
+        f.write(mode.to_bytes(4, "big"))
 
-            idx += 62 + len(name_bytes) + 1
+        f.write(e.uid.to_bytes(4, "big"))
+        f.write(e.gid.to_bytes(4, "big"))
 
-            # Add padding if necessary.
-            if idx % 8 != 0:
-                pad = 8 - (idx % 8)
-                f.write((0).to_bytes(pad, "big"))
-                idx += pad
+        f.write((0 if e.mtime[0] >= index_mtime_s else e.fsize).to_bytes(4, "big"))
+        # @FIXME Convert back to int.
+        f.write(int(e.sha, 16).to_bytes(20, "big"))
+
+        flag_assume_valid = 0x1 << 15 if e.flag_assume_valid else 0
+
+        name_bytes = e.name.encode("utf8")
+        bytes_len = len(name_bytes)
+        if bytes_len >= 0xFFF:
+            name_length = 0xFFF
+        else:
+            name_length = bytes_len
+
+        # We merge back three pieces of data (two flags and the
+        # length of the name) on the same two bytes.
+        f.write((flag_assume_valid | e.flag_stage | name_length).to_bytes(2, "big"))
+
+        # Write back the name, and a final 0x00.
+        f.write(name_bytes)
+        f.write((0).to_bytes(1, "big"))
+
+        idx += 62 + len(name_bytes) + 1
+
+        # Add padding if necessary.
+        if idx % 8 != 0:
+            pad = 8 - (idx % 8)
+            f.write((0).to_bytes(pad, "big"))
+            idx += pad
+
+    # TRAILER: SHA-1 of everything above, as real Git expects.
+    raw.write(f.h.digest())
 
 
 def index_read(repo):
@@ -1074,18 +1446,84 @@ def cmd_ls_files(args):
 
 
 
+class GitIgnoreRule(object):
+    def __init__(self, regex, negate, dir_only):
+        self.regex = regex       # Compiled pattern
+        self.negate = negate     # "!pattern": re-include
+        self.dir_only = dir_only # "pattern/": only matches directories
+
+
+def gitignore_translate(pattern):
+    """Translate a gitignore glob into a regex, following gitignore(5)."""
+    # A slash at the start or in the middle anchors the pattern to the
+    # .gitignore's directory.  Otherwise it matches a name at any depth.
+    anchored = "/" in pattern
+    if pattern.startswith("/"):
+        pattern = pattern[1:]
+
+    out = ""
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if pattern.startswith("**/", i) and (i == 0 or pattern[i-1] == "/"):
+            out += "(?:.*/)?"    # Leading "**/" and "/**/": zero or more dirs
+            i += 3
+        elif pattern.startswith("**", i) and i + 2 == len(pattern) and (i == 0 or pattern[i-1] == "/"):
+            out += ".*"          # Trailing "/**": everything inside
+            i += 2
+        elif c == "*":
+            out += "[^/]*"
+            i += 1
+        elif c == "?":
+            out += "[^/]"
+            i += 1
+        elif c == "[":
+            end = pattern.find("]", i + 2)
+            if end == -1:
+                out += re.escape(c)
+                i += 1
+            else:
+                body = pattern[i+1:end]
+                if body[0] == "!":
+                    body = "^" + body[1:]
+                out += "[" + body.replace("\\", "\\\\") + "]"
+                i = end + 1
+        elif c == "\\" and i + 1 < len(pattern):
+            out += re.escape(pattern[i+1])
+            i += 2
+        else:
+            out += re.escape(c)
+            i += 1
+
+    if anchored:
+        return re.compile(out + r"\Z", re.S)
+    return re.compile(r"(?:.*/)?" + out + r"\Z", re.S)
+
+
 def gitignore_parse1(raw):
-    raw = raw.strip() # Remove leading/trailing spaces
+    raw = raw.rstrip("\n\r")
+
+    # Trailing spaces are ignored unless escaped with a backslash.
+    while raw.endswith(" ") and not raw.endswith("\\ "):
+        raw = raw[:-1]
 
     if not raw or raw[0] == "#":
         return None
-    elif raw[0] == "!":
-        return (raw[1:], False)
+
+    negate = False
+    if raw[0] == "!":
+        negate = True
+        raw = raw[1:]
     elif raw[0] == "\\":
-        return (raw[1:], True)
-    else:
-        return (raw, True)
-    
+        raw = raw[1:]
+
+    dir_only = raw.endswith("/")
+    raw = raw.rstrip("/")
+    if not raw:
+        return None
+
+    return GitIgnoreRule(gitignore_translate(raw), negate, dir_only)
+
 
 def gitignore_parse(lines):
     ret = list()
@@ -1103,20 +1541,14 @@ class GitIgnore(object):
     scoped = None
 
     def __init__(self, absolute, scoped):
-        self.absolute = absolute
-        self.scoped = scoped
+        self.absolute = absolute # Rules from info/exclude and the global ignore file
+        self.scoped = scoped     # Directory -> rules from its .gitignore
 
 
 def gitignore_read(repo):
     ret = GitIgnore(absolute=list(), scoped=dict())
 
-    # Read local configuration in .git/info/exclude
-    repo_file = os.path.join(repo.gitdir, "info/exclude")
-    if os.path.exists(repo_file):
-        with open(repo_file, "r") as f:
-            ret.absolute.append(gitignore_parse(f.readlines()))
-
-    # Global configuration
+    # Global configuration (lowest precedence)
     if "XDG_CONFIG_HOME" in os.environ:
         config_home = os.environ["XDG_CONFIG_HOME"]
     else:
@@ -1125,59 +1557,73 @@ def gitignore_read(repo):
 
     if os.path.exists(global_file):
         with open(global_file, "r") as f:
-            ret.absolute.append(gitignore_parse(f.readlines()))
+            ret.absolute += gitignore_parse(f.readlines())
 
-    # .gitignore files in the index
-    index = index_read(repo)
+    # Read local configuration in .git/info/exclude
+    repo_file = os.path.join(repo.gitdir, "info/exclude")
+    if os.path.exists(repo_file):
+        with open(repo_file, "r") as f:
+            ret.absolute += gitignore_parse(f.readlines())
 
-    for entry in index.entries:
-        if entry.name == ".gitignore" or entry.name.endswith("/.gitignore"):
-            dir_name = os.path.dirname(entry.name)
-            contents = object_read(repo, entry.sha)
-            lines = contents.blobdata.decode("utf8").splitlines()
-            ret.scoped[dir_name] = gitignore_parse(lines)
+    # .gitignore files in the working tree, like real Git
+    for (root, dirs, files) in os.walk(repo.worktree):
+        if root == repo.worktree and ".git" in dirs:
+            dirs.remove(".git")
+        if ".gitignore" in files:
+            dir_name = os.path.relpath(root, repo.worktree)
+            if dir_name == ".":
+                dir_name = ""
+            # Like Git (2.32+), don't follow a .gitignore that is a symlink.
+            if not os.path.islink(os.path.join(root, ".gitignore")):
+                with open(os.path.join(root, ".gitignore"), "r", encoding="utf8", errors="replace") as f:
+                    ret.scoped[dir_name] = gitignore_parse(f.readlines())
     return ret
 
 
-def check_ignore1(rules, path):
+def check_ignore1(rules, path, is_dir):
+    # Within a set of rules, the last matching pattern wins.
     result = None
-    for (pattern, value) in rules:
-        if fnmatch(path, pattern):
-            result = value
+    for rule in rules:
+        if rule.dir_only and not is_dir:
+            continue
+        if rule.regex.match(path):
+            result = not rule.negate
     return result
 
 
-def check_ignore_scoped(rules, path):
+def check_ignore_path(rules, path, is_dir):
+    # A .gitignore deeper in the tree beats one higher up, which beats
+    # info/exclude and the global file.
     parent = os.path.dirname(path)
     while True:
-        if parent in rules:
-            result = check_ignore1(rules[parent], path)
+        if parent in rules.scoped:
+            relpath = path[len(parent)+1:] if parent else path
+            result = check_ignore1(rules.scoped[parent], relpath, is_dir)
             if result != None:
                 return result
         if parent == "":
             break
         parent = os.path.dirname(parent)
-    return None
+
+    return check_ignore1(rules.absolute, path, is_dir) or False
 
 
-def check_ignore_absolute(rules, path):
-    parent = os.path.dirname(path)
-    for ruleset in rules:
-        result = check_ignore1(ruleset, path)
-        if result != None:
-            return result
-    return False # This is a reasonable default at this point
-
-
-def check_ignore(rules, path):
+def check_ignore(rules, path, is_dir=False):
     if os.path.isabs(path):
         raise Exception("This function requires path to be relative to the repository's root")
 
-    result = check_ignore_scoped(rules.scoped, path)
-    if result != None:
-        return result
+    if path.endswith("/"):
+        path = path.rstrip("/")
+        is_dir = True
 
-    return check_ignore_absolute(rules.absolute, path)
+    # Git doesn't descend into ignored directories, so nothing inside
+    # one can be re-included.
+    parts = path.split("/")
+    for i in range(1, len(parts)):
+        if check_ignore_path(rules, "/".join(parts[:i]), True):
+            return True
+
+    return check_ignore_path(rules, path, is_dir)
 
 
 
@@ -1185,7 +1631,10 @@ def cmd_check_ignore(args):
     repo = repo_find()
     rules = gitignore_read(repo)
     for path in args.path:
-        if check_ignore(rules, path):
+        # Like Git, an existing directory matches directory-only patterns.
+        full = os.path.join(repo.worktree, path)
+        is_dir = os.path.isdir(full) and not os.path.islink(full)
+        if check_ignore(rules, path, is_dir):
             print(path)
 
 
@@ -1213,6 +1662,8 @@ def cmd_status_branch(repo):
 def tree_to_dict(repo, ref, prefix=""):
     ret = dict()
     tree_sha = object_find(repo, ref, fmt=b"tree")
+    if tree_sha is None: # No commits yet
+        return ret
     tree = object_read(repo, tree_sha)
 
     for leaf in tree.items:
@@ -1229,7 +1680,7 @@ def tree_to_dict(repo, ref, prefix=""):
         if is_subtree:
             ret.update(tree_to_dict(repo, leaf.sha, full_path))
         else:
-            ret[full_path] = leaf.sha
+            ret[full_path] = (leaf.mode.lstrip(b"0"), leaf.sha)
     return ret
 
 
@@ -1238,8 +1689,9 @@ def cmd_status_head_index(repo, index):
 
     head = tree_to_dict(repo, "HEAD")
     for entry in index.entries:
+        mode = f"{entry.mode_type:o}{entry.mode_perms:04o}".encode("ascii")
         if entry.name in head:
-            if head[entry.name] != entry.sha:
+            if head[entry.name] != (mode, entry.sha):
                 print("  modified:", entry.name)
             del head[entry.name] # Delete the key
         else:
@@ -1249,6 +1701,11 @@ def cmd_status_head_index(repo, index):
     # and thus have been deleted.
     for entry in head.keys():
         print("  deleted: ", entry)
+
+
+def symlink_sha(path):
+    """A symlink is stored as a blob of its target path, not followed."""
+    return object_write(GitBlob(os.fsencode(os.readlink(path))), None)
 
 
 def cmd_status_index_worktree(repo, index):
@@ -1261,10 +1718,11 @@ def cmd_status_index_worktree(repo, index):
     all_files = list()
 
     # We begin by walking the filesystem
-    for (root, _, files) in os.walk(repo.worktree, True):
+    for (root, dirs, files) in os.walk(repo.worktree, True):
         if root==repo.gitdir or root.startswith(gitdir_prefix):
             continue
-        for f in files:
+        # A symlink to a directory is a file to Git (os.walk lists it as a dir).
+        for f in files + [d for d in dirs if os.path.islink(os.path.join(root, d))]:
             full_path = os.path.join(root, f)
             rel_path = os.path.relpath(full_path, repo.worktree)
             all_files.append(rel_path)
@@ -1277,15 +1735,35 @@ def cmd_status_index_worktree(repo, index):
 
         # That file *name* is in the index
 
-        if not os.path.exists(full_path):
+        if entry.mode_type == 0b1110: # Submodule: its contents belong to its own repository
+            if not os.path.lexists(full_path):
+                print("  deleted: ", entry.name)
+        elif entry.mode_type == 0b1010: # Symlink: the blob holds the link's target
+            if not os.path.lexists(full_path) or \
+               (os.path.isdir(full_path) and not os.path.islink(full_path)):
+                print("  deleted: ", entry.name) # Gone, or replaced by a directory
+            elif not os.path.islink(full_path) or symlink_sha(full_path) != entry.sha:
+                print("  modified:", entry.name)
+        elif os.path.islink(full_path): # A file replaced by a symlink: a type change
+            print("  modified:", entry.name)
+        elif not os.path.isfile(full_path): # Gone, or replaced by a directory
             print("  deleted: ", entry.name)
         else:
             stat = os.stat(full_path)
 
+            # The executable bit is part of the file's tracked state.
+            wt_perms = 0o755 if stat.st_mode & 0o100 else 0o644
+            mode_changed = entry.mode_type == 0b1000 and entry.mode_perms != wt_perms
+
             # Compare metadata
             ctime_ns = entry.ctime[0] * 10**9 + entry.ctime[1]
             mtime_ns = entry.mtime[0] * 10**9 + entry.mtime[1]
-            if (stat.st_ctime_ns != ctime_ns) or (stat.st_mtime_ns != mtime_ns):
+            # A racily clean entry was smudged to size 0 by index_write, so
+            # the size check below makes it get re-hashed.
+            if mode_changed:
+                print("  modified:", entry.name)
+            elif (stat.st_ctime_ns != ctime_ns) or (stat.st_mtime_ns != mtime_ns) \
+                 or stat.st_size != entry.fsize:
                 # If different, deep compare.
                 # @FIXME This *will* crash on symlinks to dir.
                 with open(full_path, "rb") as fd:
@@ -1323,9 +1801,14 @@ argsp = argsubparsers.add_parser("rm", help="Remove files from the working tree 
 argsp.add_argument("path", nargs="+", help="Files to remove")
 
 
-def rm(repo, paths, delete=True, skip_missing=False):
-    # Find and read the index
-    index = index_read(repo)
+def rm(repo, paths, delete=True, skip_missing=False, index=None):
+    # Without an index from the caller, lock, read, update and write it.
+    if index is None:
+        with LockFile(repo_file(repo, "index")) as lock:
+            index = index_read(repo)
+            rm(repo, paths, delete, skip_missing, index)
+            index_write(repo, index, lock)
+        return
 
     worktree = repo.worktree + os.sep
 
@@ -1363,11 +1846,16 @@ def rm(repo, paths, delete=True, skip_missing=False):
     # Physically delete paths from filesystem.
     if delete:
         for path in remove:
-            os.unlink(path)
+            if os.path.lexists(path): # It may already be gone from the worktree
+                os.unlink(path)
+            # Like git, remove directories this leaves empty.
+            parent = os.path.dirname(path)
+            while parent != repo.worktree and os.path.isdir(parent) and not os.listdir(parent):
+                os.rmdir(parent)
+                parent = os.path.dirname(parent)
 
-    # Update the list of entries in the index, and write it back.
+    # Update the list of entries in the index; the caller writes it back.
     index.entries = kept_entries
-    index_write(repo, index)
 
 
 def cmd_rm(args):
@@ -1381,9 +1869,15 @@ argsp.add_argument("path", nargs="+", help="Files to add")
 
 
 def add(repo, paths, delete=True, skip_missing=False):
+    with LockFile(repo_file(repo, "index")) as lock:
+        index = index_read(repo)
+        add_to_index(repo, index, paths)
+        index_write(repo, index, lock)
 
+
+def add_to_index(repo, index, paths):
     # First remove all paths from the index, if they exist.
-    rm (repo, paths, delete=False, skip_missing=True)
+    rm (repo, paths, delete=False, skip_missing=True, index=index)
 
     worktree = repo.worktree + os.sep
 
@@ -1392,37 +1886,53 @@ def add(repo, paths, delete=True, skip_missing=False):
     clean_paths = set()
     for path in paths:
         abspath = os.path.abspath(path)
-        if not (abspath.startswith(worktree) and os.path.isfile(abspath)):
+        if not (abspath.startswith(worktree) and (os.path.isfile(abspath) or os.path.islink(abspath))):
             raise Exception(f"Not a file, or outside the worktree: {paths}")
         relpath = os.path.relpath(abspath, repo.worktree)
         clean_paths.add((abspath,  relpath))
 
-    # Find and read the index.  It was modified by rm.  (This isn't
-    # optimal, good enough for wyag!)
-    #
-    # @FIXME, though: we could just move the index through
-    # commands instead of reading and writing it over again.
-    index = index_read(repo)
+    # A path can't be both a file and a directory.  Like git add, drop
+    # entries for a file that is now a directory of the new path, and for
+    # files under a directory that is now this file.
+    conflicts = set()
+    for (_, relpath) in clean_paths:
+        parent = os.path.dirname(relpath)
+        while parent:
+            conflicts.add(parent)
+            parent = os.path.dirname(parent)
+    new_files = set(relpath + "/" for (_, relpath) in clean_paths)
+    index.entries = [e for e in index.entries
+                     if e.name not in conflicts
+                     and not any(e.name.startswith(d) for d in new_files)]
 
     for (abspath, relpath) in clean_paths:
+        if os.path.islink(abspath): # Stage the link itself, not what it points to
+            stat = os.lstat(abspath)
+            ctime_s, ctime_ns = divmod(stat.st_ctime_ns, 10**9)
+            mtime_s, mtime_ns = divmod(stat.st_mtime_ns, 10**9)
+            sha = object_write(GitBlob(os.fsencode(os.readlink(abspath))), repo)
+            index.entries.append(GitIndexEntry(
+                ctime=(ctime_s, ctime_ns), mtime=(mtime_s, mtime_ns), dev=stat.st_dev,
+                ino=stat.st_ino, mode_type=0b1010, mode_perms=0, uid=stat.st_uid,
+                gid=stat.st_gid, fsize=stat.st_size, sha=sha, flag_assume_valid=False,
+                flag_stage=False, name=relpath))
+            continue
         with open(abspath, "rb") as fd:
             sha = object_hash(fd, b"blob", repo)
 
             stat = os.stat(abspath)
 
-            ctime_s = int(stat.st_ctime)
-            ctime_ns = stat.st_ctime_ns % 10**9
-            mtime_s = int(stat.st_mtime)
-            mtime_ns = stat.st_mtime_ns % 10**9
+            # Git only tracks the executable bit: 100755 or 100644.
+            mode_perms = 0o755 if stat.st_mode & 0o100 else 0o644
+
+            ctime_s, ctime_ns = divmod(stat.st_ctime_ns, 10**9)
+            mtime_s, mtime_ns = divmod(stat.st_mtime_ns, 10**9)
 
             entry = GitIndexEntry(ctime=(ctime_s, ctime_ns), mtime=(mtime_s, mtime_ns), dev=stat.st_dev, ino=stat.st_ino,
-                                  mode_type=0b1000, mode_perms=0o644, uid=stat.st_uid, gid=stat.st_gid,
+                                  mode_type=0b1000, mode_perms=mode_perms, uid=stat.st_uid, gid=stat.st_gid,
                                   fsize=stat.st_size, sha=sha, flag_assume_valid=False,
                                   flag_stage=False, name=relpath)
             index.entries.append(entry)
-
-    # Write the index back
-    index_write(repo, index)
 
 
 
@@ -1534,9 +2044,9 @@ def commit_create(repo, tree, parent, author, timestamp, message):
     message = message.strip() + "\n"
     # Format timezone
     offset = int(timestamp.astimezone().utcoffset().total_seconds())
-    hours = offset // 3600
-    minutes = (offset % 3600) // 60
-    tz = "{}{:02}{:02}".format("+" if offset > 0 else "-", hours, minutes)
+    hours = abs(offset) // 3600
+    minutes = (abs(offset) % 3600) // 60
+    tz = "{}{:02}{:02}".format("+" if offset >= 0 else "-", hours, minutes)
 
     author = author + timestamp.strftime(" %s ") + tz
 
@@ -1564,12 +2074,12 @@ def cmd_commit(args):
 
     # Update HEAD so our commit is now the tip of the active branch.
     active_branch = branch_get_active(repo)
+    # The commit and its trees are already durable, so moving the ref last
+    # means a crash can never leave it pointing at a missing object.
     if active_branch: # If we're on a branch, we update refs/heads/BRANCH
-        with open(repo_file(repo, os.path.join("refs/heads", active_branch)), "w") as fd:
-            fd.write(commit + "\n")
+        ref_write(repo, os.path.join("refs/heads", active_branch), commit)
     else: # Otherwise, we update HEAD itself.
-        with open(repo_file(repo, "HEAD"), "w") as fd:
-            fd.write("\n")
+        ref_write(repo, "HEAD", commit)
               
 
 

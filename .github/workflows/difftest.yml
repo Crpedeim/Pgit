@@ -1,0 +1,56 @@
+name: difftest
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  difftest:
+    name: Differential test against real Git (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Random operation sequences, Pgit vs Git
+        run: python3 tests/difftest.py --runs 200
+      - name: Upload minimal reproduction
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: difftest-failure-${{ matrix.python }}
+          path: difftest-failure-*.json
+
+  mutants:
+    name: Tester catches reintroduced bugs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 tests/mutants.py
+
+  crashtest:
+    name: Repository survives crashes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 tests/crashtest.py --kills 100
+
+  packtest:
+    name: Reads packed repositories like Git
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 tests/packtest.py --clone https://github.com/pallets/flask.git
