@@ -2,13 +2,21 @@
 
 [![difftest](https://github.com/Crpedeim/Pgit/actions/workflows/difftest.yml/badge.svg)](https://github.com/Crpedeim/Pgit/actions/workflows/difftest.yml)
 
-A working reimplementation of Git's internals in a single Python library (~1,600 lines). Not a wrapper around the `git` binary — a from-scratch implementation of the **object database**, **content-addressable storage**, the **staging index**, the **reference system**, and `.gitignore` matching, following the structure of Thibault Polge's *Write Yourself a Git*.
+A working reimplementation of Git's internals in a single Python library (~2,000 lines). Not a wrapper around the `git` binary — a from-scratch implementation of the **object database**, **content-addressable storage**, the **staging index**, the **reference system**, and `.gitignore` matching, following the structure of Thibault Polge's *Write Yourself a Git*.
 
 **The defining property: Pgit is byte-for-byte interoperable with real Git.** Objects it writes are read by real `git`; repositories real `git` creates are read by Pgit — because Pgit implements Git's exact on-disk formats rather than approximating them.
+
+## Demo
+
+| What Pgit does | How it's tested |
+|---|---|
+| [![Pgit demo: basics and reading a real cloned repository](https://img.youtube.com/vi/hkuoLsDaoPs/hqdefault.jpg)](https://youtu.be/hkuoLsDaoPs) | [![Pgit demo: crash safety and the test harnesses](https://img.youtube.com/vi/ON8LzCZxVcc/hqdefault.jpg)](https://youtu.be/ON8LzCZxVcc) |
+| Pgit creates a repository that real Git accepts (same SHAs, `git fsck` passes), then reads a repository cloned from GitHub: every object packed, history, trees and refs identical to Git's. | Before vs after crash safety under `kill -9` and concurrent writers, then the differential tester against real Git and the pack tester on a real clone. |
 
 ---
 
 ## Table of contents
+- [Demo](#demo)
 - [Interoperability (verified)](#interoperability-verified)
 - [Differential testing against real Git](#differential-testing-against-real-git)
 - [Crash safety](#crash-safety)
